@@ -37,8 +37,16 @@ func DotGitIsDir(repo string) bool {
 	return fi.IsDir()
 }
 
-// ListWorktreePaths returns linked worktree paths in git's order (main worktree first).
-func ListWorktreePaths(repo string) ([]string, error) {
+// WorktreeInfo is one worktree from `git worktree list --porcelain`.
+type WorktreeInfo struct {
+	Path     string // absolute or normalized checkout path
+	Head     string // revparse target (usually a hex SHA)
+	Branch   string // short branch name (no refs/heads/); empty when detached or missing
+	Detached bool
+}
+
+// ListWorktreesDetail parses `git worktree list --porcelain` for paths, HEAD, and branch state.
+func ListWorktreesDetail(repo string) ([]WorktreeInfo, error) {
 	cmd := gitCmd(repo, "worktree", "list", "--porcelain")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -46,15 +54,77 @@ func ListWorktreePaths(repo string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("git worktree list: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
-	var paths []string
+	var blocks [][]string
+	var cur []string
 	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "worktree ") {
-			p := strings.TrimSpace(strings.TrimPrefix(line, "worktree"))
-			if p != "" {
-				paths = append(paths, filepath.Clean(p))
+		if line == "" {
+			if len(cur) > 0 {
+				blocks = append(blocks, cur)
+				cur = nil
+			}
+			continue
+		}
+		cur = append(cur, line)
+	}
+	if len(cur) > 0 {
+		blocks = append(blocks, cur)
+	}
+	var infos []WorktreeInfo
+	for _, b := range blocks {
+		var info WorktreeInfo
+		for _, raw := range b {
+			line := strings.TrimSpace(raw)
+			switch {
+			case strings.HasPrefix(line, "worktree "):
+				p := strings.TrimSpace(strings.TrimPrefix(line, "worktree"))
+				if p != "" {
+					info.Path = filepath.Clean(p)
+				}
+			case strings.HasPrefix(line, "HEAD "):
+				info.Head = strings.TrimSpace(strings.TrimPrefix(line, "HEAD "))
+			case strings.HasPrefix(line, "branch "):
+				ref := strings.TrimSpace(strings.TrimPrefix(line, "branch "))
+				info.Detached = false
+				if strings.HasPrefix(ref, "refs/heads/") {
+					info.Branch = strings.TrimPrefix(ref, "refs/heads/")
+				} else if ref != "" {
+					info.Branch = ref
+				}
+			case line == "detached":
+				info.Detached = true
 			}
 		}
+		if info.Path != "" {
+			infos = append(infos, info)
+		}
+	}
+	return infos, nil
+}
+
+// RemoveWorktree runs git worktree remove from the primary (or any) worktree of the repo.
+func RemoveWorktree(primaryRepo, worktreePath string) error {
+	worktreePath = filepath.Clean(worktreePath)
+	if worktreePath == "" {
+		return fmt.Errorf("empty worktree path")
+	}
+	cmd := gitCmd(primaryRepo, "worktree", "remove", worktreePath)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("git worktree remove %q: %w: %s", worktreePath, err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+// ListWorktreePaths returns linked worktree paths in git's order (main worktree first).
+func ListWorktreePaths(repo string) ([]string, error) {
+	infos, err := ListWorktreesDetail(repo)
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, len(infos))
+	for i := range infos {
+		paths[i] = infos[i].Path
 	}
 	return paths, nil
 }
@@ -82,6 +152,11 @@ func PickPrimaryWorktree(paths []string) string {
 	}
 	sort.Strings(paths)
 	return paths[0]
+}
+
+// SortPathsPrimaryFirst places primary first, then remaining paths sorted.
+func SortPathsPrimaryFirst(paths []string, primary string) []string {
+	return sortPathsPrimaryFirst(paths, primary)
 }
 
 func sortPathsPrimaryFirst(paths []string, primary string) []string {

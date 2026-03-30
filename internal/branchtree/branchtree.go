@@ -32,6 +32,8 @@ const (
 	RowBranch
 	RowPR
 	RowTag // lightweight tag (e.g. from archive); not a branch row
+	RowWorktreePath
+	RowWorktreeBranch // branch line for a linked worktree (U + WorktreeAbs)
 )
 
 // Row is one visible line in the branch tree preview.
@@ -40,9 +42,15 @@ type Row struct {
 	Depth   int
 	Rel     string // folder path key
 	Label   string
-	U       *gitx.UnifiedBranch // only for RowBranch
+	U       *gitx.UnifiedBranch // RowBranch and RowWorktreeBranch; may be nil when detached
 	PR      *ghpr.PR            // only for RowPR
 	TagName string              // only for RowTag (full tag name)
+	// WorktreeAbs is the worktree directory for RowWorktreePath / RowWorktreeBranch.
+	WorktreeAbs string
+	// IsPrimary marks the main worktree on RowWorktreePath (cannot be removed).
+	IsPrimary bool
+	// BranchFullName is set on RowWorktreeBranch (non-detached): full branch name even if U is nil.
+	BranchFullName string
 }
 
 // Build constructs a tree from unified branches (FullName uses / for nesting).

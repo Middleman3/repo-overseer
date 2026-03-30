@@ -28,12 +28,13 @@ const (
 )
 
 type snapshot struct {
-	current string
-	unified []gitx.UnifiedBranch
-	prs     []ghpr.PR
-	tags    []string // all lightweight tags (e.g. archive tags)
-	gitErr  string
-	ghErr   string
+	current   string
+	unified   []gitx.UnifiedBranch
+	prs       []ghpr.PR
+	tags      []string // all lightweight tags (e.g. archive tags)
+	worktrees []gitx.WorktreeInfo
+	gitErr    string
+	ghErr     string
 }
 
 type snapshotMsg struct {
@@ -58,8 +59,8 @@ type archiveDoneMsg struct {
 }
 
 type checkoutDoneMsg struct {
-	repo string
-	err  error
+	snapshotKey string
+	err         error
 }
 
 // archiveConfirmDialog blocks the UI until the user confirms or cancels archive.
@@ -87,15 +88,32 @@ type deleteDoneMsg struct {
 }
 
 type pushPRDoneMsg struct {
-	repo   string
-	branch string
-	err    error
+	snapshotKey string
+	branch      string
+	err         error
+}
+
+type worktreeRemoveDoneMsg struct {
+	snapshotKey string
+	err         error
+}
+
+// worktreeRemoveDialog is a one- or two-step confirm for removing a linked worktree.
+type worktreeRemoveDialog struct {
+	primary     string
+	worktreeAbs string
+	branch      string // branch checked out in that worktree; empty if detached
+	riskDetail  string // non-empty => show second confirm after first yes
+	secondStep  bool   // when true, second warning dialog is active
 }
 
 const preloadWorkers = 4
 
 // archivedTagsRel is the folder key for the collapsible "Archived tags" list (default collapsed).
 const archivedTagsRel = "__archived_tags__"
+
+// worktreesFolderRel is the folder key for the collapsible "Worktrees" section in preview.
+const worktreesFolderRel = "__worktrees__"
 
 // Model is the interactive browser state.
 type Model struct {
@@ -121,6 +139,7 @@ type Model struct {
 	prefs              Prefs
 	archiveConfirm     *archiveConfirmDialog
 	deleteConfirm      *deleteConfirmDialog
+	worktreeRemove     *worktreeRemoveDialog
 	statusMsg          string
 	width              int
 	height             int
@@ -420,7 +439,7 @@ func (m *Model) previewBranchLineURLs(repoPath string, s snapshot, webBase strin
 	if !gitx.IsWorkTree(repoPath) {
 		return []string{""}
 	}
-	if len(s.unified) == 0 && len(s.prs) == 0 && len(s.tags) == 0 {
+	if len(s.unified) == 0 && len(s.prs) == 0 && len(s.tags) == 0 && len(s.worktrees) <= 1 {
 		return []string{""}
 	}
 	rows, unmatched := m.branchRowsAndUnmatched(repoPath, s)
@@ -441,6 +460,18 @@ func (m *Model) previewBranchLineURLs(repoPath string, s snapshot, webBase strin
 			urls = append(urls, r.PR.URL)
 		case branchtree.RowTag:
 			urls = append(urls, gitx.TagTreeURL(webBase, r.TagName))
+		case branchtree.RowWorktreePath:
+			urls = append(urls, "")
+		case branchtree.RowWorktreeBranch:
+			if r.U != nil {
+				urls = append(urls, gitx.BranchTreeURL(webBase, r.U.FullName))
+				continue
+			}
+			if r.BranchFullName != "" {
+				urls = append(urls, gitx.BranchTreeURL(webBase, r.BranchFullName))
+				continue
+			}
+			urls = append(urls, "")
 		}
 	}
 	if len(unmatched) > 0 {
@@ -494,34 +525,9 @@ func (m *Model) snapshotHeaderBeforeTree(path string, s snapshot) string {
 	} else {
 		b.WriteString("Checked out: (detached or empty)\n\n")
 	}
-	wts := m.worktreesForRepo(path)
-	if len(wts) > 1 {
-		b.WriteString(lipgloss.NewStyle().Bold(true).Render("Worktrees"))
-		b.WriteString("\n")
-		for _, wt := range wts {
-			label := m.relDisplay(wt)
-			suffix := ""
-			if filepath.Clean(wt) == filepath.Clean(path) {
-				suffix = "  (primary)"
-			}
-			fmt.Fprintf(&b, "  ◦ %s%s\n", label, suffix)
-		}
-		b.WriteString("\n")
-	}
 	b.WriteString(lipgloss.NewStyle().Bold(true).Render("Branches / PRs"))
 	b.WriteString("\n")
 	return b.String()
-}
-
-func (m *Model) worktreesForRepo(primary string) []string {
-	if m.worktreesByRepo == nil {
-		return nil
-	}
-	wts := m.worktreesByRepo[primary]
-	if len(wts) == 0 {
-		return nil
-	}
-	return wts
 }
 
 func firstLineIndexAfterHeader(header string) int {
@@ -605,14 +611,11 @@ func (m *Model) appendArchivedTagRows(repoPath string, s snapshot, rows []branch
 	return rows
 }
 
-func (m *Model) branchRowsAndUnmatched(repoPath string, s snapshot) (rows []branchtree.Row, unmatched []ghpr.PR) {
+func (m *Model) buildBranchTreeRowsOnly(repoPath string, s snapshot) (rows []branchtree.Row, unmatched []ghpr.PR) {
 	if s.gitErr != "" {
 		return nil, nil
 	}
 	if !gitx.IsWorkTree(repoPath) {
-		return nil, nil
-	}
-	if len(s.unified) == 0 && len(s.prs) == 0 && len(s.tags) == 0 {
 		return nil, nil
 	}
 	if len(s.unified) > 0 || len(s.prs) > 0 {
@@ -627,7 +630,133 @@ func (m *Model) branchRowsAndUnmatched(repoPath string, s snapshot) (rows []bran
 		}, &rows)
 	}
 	rows = m.appendArchivedTagRows(repoPath, s, rows)
+	if len(rows) == 0 {
+		return nil, unmatched
+	}
 	return rows, unmatched
+}
+
+func (m *Model) prependWorktreeRows(repoPath string, s snapshot, base []branchtree.Row) []branchtree.Row {
+	if len(s.worktrees) <= 1 || s.gitErr != "" {
+		return base
+	}
+	var out []branchtree.Row
+	out = append(out, branchtree.Row{
+		Kind:  branchtree.RowFolder,
+		Depth: 0,
+		Rel:   worktreesFolderRel,
+		Label: "Worktrees",
+	})
+	if !m.isBranchFolderExpanded(repoPath, worktreesFolderRel) {
+		return append(out, base...)
+	}
+	for _, wt := range s.worktrees {
+		isPri := filepath.Clean(wt.Path) == filepath.Clean(repoPath)
+		label := m.relDisplay(wt.Path)
+		if isPri {
+			label += "  (primary)"
+		}
+		out = append(out, branchtree.Row{
+			Kind:        branchtree.RowWorktreePath,
+			Depth:       1,
+			Label:       label,
+			WorktreeAbs: wt.Path,
+			IsPrimary:   isPri,
+		})
+		if wt.Detached || strings.TrimSpace(wt.Branch) == "" {
+			out = append(out, branchtree.Row{
+				Kind:        branchtree.RowWorktreeBranch,
+				Depth:       2,
+				Label:       "(detached)",
+				WorktreeAbs: wt.Path,
+				U:           nil,
+			})
+			continue
+		}
+		u := unifiedByFullName(s, wt.Branch)
+		short := branchLabelName(wt.Branch)
+		out = append(out, branchtree.Row{
+			Kind:           branchtree.RowWorktreeBranch,
+			Depth:          2,
+			Label:          short,
+			WorktreeAbs:    wt.Path,
+			U:              u,
+			BranchFullName: wt.Branch,
+		})
+	}
+	return append(out, base...)
+}
+
+func (m *Model) branchRowsAndUnmatched(repoPath string, s snapshot) (rows []branchtree.Row, unmatched []ghpr.PR) {
+	base, unmatched := m.buildBranchTreeRowsOnly(repoPath, s)
+	return m.prependWorktreeRows(repoPath, s, base), unmatched
+}
+
+func unifiedByFullName(s snapshot, full string) *gitx.UnifiedBranch {
+	for i := range s.unified {
+		if s.unified[i].FullName == full {
+			return &s.unified[i]
+		}
+	}
+	return nil
+}
+
+func branchLabelName(full string) string {
+	if i := strings.LastIndex(full, "/"); i >= 0 {
+		return full[i+1:]
+	}
+	return full
+}
+
+func worktreeRemoveNeedsExtraConfirm(branch string, u *gitx.UnifiedBranch) bool {
+	if strings.TrimSpace(branch) == "" {
+		return true
+	}
+	if u == nil {
+		return true
+	}
+	if u.Local == nil {
+		return true
+	}
+	if u.Remote == nil {
+		return true
+	}
+	if u.SyncErr != "" {
+		return true
+	}
+	if u.Ahead > 0 || u.Behind > 0 {
+		return true
+	}
+	return false
+}
+
+func worktreeRemoveRiskDetail(branch string, u *gitx.UnifiedBranch) string {
+	var parts []string
+	if strings.TrimSpace(branch) == "" {
+		return "Detached HEAD or unknown branch."
+	}
+	if u == nil {
+		return fmt.Sprintf("Could not load sync status for %q (missing from branch list).", branch)
+	}
+	if u.Local == nil {
+		return fmt.Sprintf("No local ref for %q in this snapshot.", branch)
+	}
+	if u.Remote == nil {
+		return "Branch has no corresponding origin/* ref (nothing pushed or no remote tracking)."
+	}
+	if u.SyncErr != "" {
+		return fmt.Sprintf("Sync check failed: %s", u.SyncErr)
+	}
+	if u.Ahead > 0 {
+		parts = append(parts, fmt.Sprintf("%d local commit(s) not on origin", u.Ahead))
+	}
+	if u.Behind > 0 {
+		parts = append(parts, fmt.Sprintf("%d commit(s) on origin not merged locally", u.Behind))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, "; ") + "."
 }
 
 func (m *Model) branchFolderAtPreviewLine() (repoAbs, folderRel string, ok bool) {
@@ -690,6 +819,22 @@ func (m *Model) selectedPreviewBranchName() (repoAbs, branch string, ok bool) {
 			return "", "", false
 		}
 		return p, ghpr.HeadBranchLocalName(r.PR.HeadRefName), true
+	case branchtree.RowWorktreeBranch:
+		if r.Label == "(detached)" {
+			return "", "", false
+		}
+		wtDir := r.WorktreeAbs
+		if wtDir == "" {
+			return "", "", false
+		}
+		full := r.BranchFullName
+		if r.U != nil {
+			full = r.U.FullName
+		}
+		if full == "" {
+			return "", "", false
+		}
+		return wtDir, full, true
 	default:
 		return "", "", false
 	}
@@ -753,6 +898,20 @@ func (m *Model) runArchiveBranchCmd(repo, branch, switchToFirst string, pendingL
 }
 
 func (m *Model) handleDeleteBranchRequest() (tea.Model, tea.Cmd) {
+	p := m.selectedAbs()
+	if p == "" {
+		return m, nil
+	}
+	snap, have := m.cache[p]
+	if !have {
+		return m, nil
+	}
+	start := m.branchTreeContentStartLine(p, snap)
+	idx := m.previewSelLine - start
+	rows, _ := m.branchRowsAndUnmatched(p, snap)
+	if idx >= 0 && idx < len(rows) && rows[idx].Kind == branchtree.RowWorktreePath {
+		return m.handleRemoveWorktreeRequest(rows[idx])
+	}
 	repo, branch, ok := m.selectedPreviewBranchName()
 	if !ok {
 		return m, nil
@@ -809,6 +968,84 @@ func (m *Model) runDeleteBranchCmd(repo, branch, switchToFirst string, pendingLi
 	}
 }
 
+func (m *Model) handleRemoveWorktreeRequest(row branchtree.Row) (tea.Model, tea.Cmd) {
+	if row.Kind != branchtree.RowWorktreePath || row.WorktreeAbs == "" {
+		return m, nil
+	}
+	if row.IsPrimary {
+		m.statusMsg = "Cannot remove the primary worktree."
+		return m, nil
+	}
+	primary := m.selectedAbs()
+	if primary == "" {
+		return m, nil
+	}
+	m.statusMsg = ""
+	branch := gitx.CurrentBranch(row.WorktreeAbs)
+	var u *gitx.UnifiedBranch
+	if snap, ok := m.cache[primary]; ok {
+		u = unifiedByFullName(snap, branch)
+	}
+	risk := ""
+	if worktreeRemoveNeedsExtraConfirm(branch, u) {
+		risk = worktreeRemoveRiskDetail(branch, u)
+	}
+	m.worktreeRemove = &worktreeRemoveDialog{
+		primary:     primary,
+		worktreeAbs: row.WorktreeAbs,
+		branch:      branch,
+		riskDetail:  risk,
+		secondStep:  false,
+	}
+	return m, nil
+}
+
+func (m *Model) handleWorktreeRemoveDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.worktreeRemove == nil {
+		return m, nil
+	}
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "y", "Y", "enter":
+		if m.worktreeRemove.secondStep {
+			pri, wt := m.worktreeRemove.primary, m.worktreeRemove.worktreeAbs
+			m.worktreeRemove = nil
+			return m, m.runRemoveWorktreeCmd(pri, wt)
+		}
+		if m.worktreeRemove.riskDetail != "" {
+			m.worktreeRemove.secondStep = true
+			return m, nil
+		}
+		pri, wt := m.worktreeRemove.primary, m.worktreeRemove.worktreeAbs
+		m.worktreeRemove = nil
+		return m, m.runRemoveWorktreeCmd(pri, wt)
+	case "n", "N", "esc", "q":
+		m.worktreeRemove = nil
+		return m, nil
+	default:
+		return m, nil
+	}
+}
+
+func (m *Model) runRemoveWorktreeCmd(primary, worktreeAbs string) tea.Cmd {
+	return func() tea.Msg {
+		err := gitx.RemoveWorktree(primary, worktreeAbs)
+		return worktreeRemoveDoneMsg{snapshotKey: primary, err: err}
+	}
+}
+
+func (m *Model) refreshWorktreesMap(primary string) {
+	if m.worktreesByRepo == nil {
+		m.worktreesByRepo = make(map[string][]string)
+	}
+	paths, err := gitx.ListWorktreePaths(primary)
+	if err != nil || len(paths) == 0 {
+		return
+	}
+	m.worktreesByRepo[primary] = gitx.SortPathsPrimaryFirst(paths, primary)
+}
+
 func (m *Model) handleCheckoutRequest() (tea.Model, tea.Cmd) {
 	repo, branch, ok := m.selectedPreviewBranchName()
 	if !ok {
@@ -818,10 +1055,11 @@ func (m *Model) handleCheckoutRequest() (tea.Model, tea.Cmd) {
 	return m, m.runCheckoutCmd(repo, branch)
 }
 
-func (m *Model) runCheckoutCmd(repo, branch string) tea.Cmd {
+func (m *Model) runCheckoutCmd(wtDir, branch string) tea.Cmd {
+	snapshotKey := m.selectedAbs()
 	return func() tea.Msg {
-		err := gitx.Checkout(repo, branch)
-		return checkoutDoneMsg{repo: repo, err: err}
+		err := gitx.Checkout(wtDir, branch)
+		return checkoutDoneMsg{snapshotKey: snapshotKey, err: err}
 	}
 }
 
@@ -834,10 +1072,11 @@ func (m *Model) handlePushPRRequest() (tea.Model, tea.Cmd) {
 	return m, m.runPushPRCmd(repo, branch)
 }
 
-func (m *Model) runPushPRCmd(repo, branch string) tea.Cmd {
+func (m *Model) runPushPRCmd(wtDir, branch string) tea.Cmd {
+	snapshotKey := m.selectedAbs()
 	return func() tea.Msg {
-		err := gitx.PushCreatePR(repo, branch)
-		return pushPRDoneMsg{repo: repo, branch: branch, err: err}
+		err := gitx.PushCreatePR(wtDir, branch)
+		return pushPRDoneMsg{snapshotKey: snapshotKey, branch: branch, err: err}
 	}
 }
 
@@ -903,8 +1142,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.statusMsg = "Checked out."
 		}
-		delete(m.cache, msg.repo)
-		return m, loadSnapshot(msg.repo, m.prLimit)
+		delete(m.cache, msg.snapshotKey)
+		return m, loadSnapshot(msg.snapshotKey, m.prLimit)
 
 	case deleteDoneMsg:
 		// Ensure modal is gone after async work (covers any missed confirm-path clear).
@@ -927,10 +1166,24 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.statusMsg = fmt.Sprintf("Opened PR for %s", msg.branch)
 		}
-		delete(m.cache, msg.repo)
-		return m, loadSnapshot(msg.repo, m.prLimit)
+		delete(m.cache, msg.snapshotKey)
+		return m, loadSnapshot(msg.snapshotKey, m.prLimit)
+
+	case worktreeRemoveDoneMsg:
+		m.worktreeRemove = nil
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("Worktree remove failed: %v", msg.err)
+		} else {
+			m.statusMsg = "Worktree removed."
+			m.refreshWorktreesMap(msg.snapshotKey)
+		}
+		delete(m.cache, msg.snapshotKey)
+		return m, loadSnapshot(msg.snapshotKey, m.prLimit)
 
 	case tea.KeyMsg:
+		if m.worktreeRemove != nil {
+			return m.handleWorktreeRemoveDialogKey(msg)
+		}
 		if m.deleteConfirm != nil {
 			return m.handleDeleteDialogKey(msg)
 		}
@@ -1089,8 +1342,8 @@ func (m *Model) applyPreviewContent() {
 		m.previewSelLine = nEff - 1
 	}
 
-	// Repo with snapshot: fixed header (repo, checked out, worktrees, "Branches / PRs") +
-	// scrollable branch list so the header is never scrolled off-screen.
+	// Repo with snapshot: fixed header (repo, checked out, "Branches / PRs") +
+	// scrollable preview (worktrees block + branch list + …) so the header is never scrolled off-screen.
 	if p != "" {
 		if snap, ok := m.cache[p]; ok {
 			treeStart := m.branchTreeContentStartLine(p, snap)
@@ -1235,10 +1488,10 @@ func (m *Model) renderBranchTree(repoPath string, s snapshot, now time.Time, web
 	if !gitx.IsWorkTree(repoPath) {
 		return "  (not a normal work tree)\n"
 	}
-	if len(s.unified) == 0 && len(s.prs) == 0 && len(s.tags) == 0 {
+	rows, unmatched := m.branchRowsAndUnmatched(repoPath, s)
+	if len(rows) == 0 && len(unmatched) == 0 {
 		return "  (no branches)\n"
 	}
-	rows, unmatched := m.branchRowsAndUnmatched(repoPath, s)
 	var out strings.Builder
 	for _, r := range rows {
 		ind := strings.Repeat("  ", r.Depth)
@@ -1280,6 +1533,18 @@ func (m *Model) renderBranchTree(repoPath string, s snapshot, now time.Time, web
 				label = m.linkText(u, r.Label)
 			}
 			fmt.Fprintf(&out, "%s◦ %s\n", ind, label)
+		case branchtree.RowWorktreePath:
+			fmt.Fprintf(&out, "%s◦ %s\n", ind, r.Label)
+		case branchtree.RowWorktreeBranch:
+			if r.U == nil {
+				fmt.Fprintf(&out, "%s◦ %s\n", ind, r.Label)
+				break
+			}
+			label := r.Label
+			if u := gitx.BranchTreeURL(webBase, r.U.FullName); u != "" {
+				label = m.linkText(u, r.Label)
+			}
+			fmt.Fprintf(&out, "%s◦ %s  %s\n", ind, label, formatUnifiedBranchMeta(r.U, now))
 		}
 	}
 	if len(unmatched) > 0 {
@@ -1374,6 +1639,9 @@ func buildSnapshot(path string, prLimit int) snapshot {
 		}
 		if tags, err := gitx.ListTags(path); err == nil {
 			s.tags = tags
+		}
+		if wts, err := gitx.ListWorktreesDetail(path); err == nil {
+			s.worktrees = wts
 		}
 	}
 	if err := ghpr.RepoViewable(path); err == nil {
@@ -1543,6 +1811,42 @@ func (m *Model) renderArchiveDialog() string {
 		Render(body)
 }
 
+func (m *Model) renderWorktreeRemoveDialog() string {
+	if m.worktreeRemove == nil {
+		return ""
+	}
+	d := m.worktreeRemove
+	w := m.width - 4
+	if w > 100 {
+		w = 100
+	}
+	pathLabel := m.relDisplay(d.worktreeAbs)
+	var body string
+	if d.secondStep {
+		head := fmt.Sprintf("Branch %q is not fully pushed or not up to date with origin.", d.branch)
+		if strings.TrimSpace(d.branch) == "" {
+			head = "This worktree is not on a named branch or sync status is unknown."
+		}
+		body = fmt.Sprintf(
+			"%s\n\n%s\n\nRemove worktree %q anyway?\n\n[y] confirm   [n] cancel",
+			head,
+			d.riskDetail,
+			pathLabel,
+		)
+	} else {
+		body = fmt.Sprintf(
+			"Remove linked worktree %q?\n\nThis runs git worktree remove. Uncommitted changes in that checkout can make the command fail.\n\n[y] confirm   [n] cancel",
+			pathLabel,
+		)
+	}
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("214")).
+		Padding(1, 2).
+		Width(w).
+		Render(body)
+}
+
 func (m *Model) renderDeleteDialog() string {
 	if m.deleteConfirm == nil {
 		return ""
@@ -1613,9 +1917,9 @@ func (m *Model) View() string {
 
 	var stack []string
 	stack = append(stack, row)
-	if dlg := m.renderDeleteDialog(); dlg != "" {
+	if dlg := m.renderWorktreeRemoveDialog(); dlg != "" {
 		stack = append(stack, "", dlg)
-	} else if dlg := m.renderArchiveDialog(); dlg != "" {
+	} else if dlg := m.renderDeleteDialog(); dlg != "" {
 		stack = append(stack, "", dlg)
 	}
 	if m.statusMsg != "" {
@@ -1632,7 +1936,7 @@ func (m *Model) View() string {
 
 	help := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("241")).
-		Render("tab/shift+tab/←/→: panes · L: preview links · preview: ↑/↓ · enter URL · c checkout · d delete · a archive · p push/PR · space folder · f/pgdn · shift+←/→ width · tree enter: branches on GitHub · g/G · r · q")
+		Render("tab/shift+tab/←/→: panes · L: preview links · preview: ↑/↓ · enter URL · c checkout · d delete branch / worktree path · a archive · p push/PR · space folder · f/pgdn · shift+←/→ width · tree enter: branches on GitHub · g/G · r · q")
 
 	stack = append(stack, "", help)
 
