@@ -121,6 +121,8 @@ type Model struct {
 	height             int
 	pendingPreviewRepo string // repo path; cleared after snapshotMsg applies pending line
 	pendingPreviewLine int    // absolute preview line; -1 means none
+	previewPaneH       int    // last laid-out inner height for the right column (header + viewport)
+	previewHeader      string // fixed region above the scrollable branch list (styled); empty if not split
 }
 
 // New builds the TUI model. absRepos must be non-empty absolute paths under scanRoot (one per logical repo).
@@ -953,7 +955,7 @@ func (m *Model) layout() {
 	}
 	m.leftColW = leftW
 	m.vp.Width = rightW
-	m.vp.Height = contentH
+	m.previewPaneH = contentH
 	m.applyPreviewContent()
 	m.ensureScroll()
 }
@@ -986,11 +988,26 @@ func (m *Model) resetPreviewLineForNewTreeRow() {
 }
 
 func (m *Model) applyPreviewContent() {
+	p := m.selectedAbs()
+	contentH := m.previewPaneH
+	if contentH <= 0 && m.height > 0 {
+		contentH = m.height - 3
+		if contentH < 6 {
+			contentH = 6
+		}
+	}
+	if contentH <= 0 {
+		contentH = 6
+	}
+
+	m.previewHeader = ""
+
 	plain := m.previewForSelection()
 	plain = strings.ReplaceAll(plain, "\r\n", "\n")
 	lines := strings.Split(plain, "\n")
 	n := len(lines)
 	if n == 0 {
+		m.vp.Height = contentH
 		m.vp.SetContent(plain)
 		return
 	}
@@ -1000,6 +1017,30 @@ func (m *Model) applyPreviewContent() {
 	if m.previewSelLine >= n {
 		m.previewSelLine = n - 1
 	}
+
+	// Repo with snapshot: fixed header (repo, checked out, worktrees, "Branches & open PRs") +
+	// scrollable branch list so the header is never scrolled off-screen.
+	if p != "" {
+		if snap, ok := m.cache[p]; ok {
+			treeStart := m.branchTreeContentStartLine(p, snap)
+			if treeStart > 0 {
+				headerPlain := m.snapshotHeaderBeforeTree(p, snap)
+				scrollPlain := m.renderSnapshotScroll(p, snap)
+				headerLines := treeStart
+				scrollH := contentH - headerLines
+				if scrollH < 3 {
+					scrollH = 3
+				}
+				m.vp.Height = scrollH
+				m.previewHeader = m.stylePreviewLinesAtGlobal(headerPlain, 0)
+				m.vp.SetContent(m.stylePreviewLinesAtGlobal(scrollPlain, treeStart))
+				m.ensurePreviewScrollVisibleSplit(treeStart)
+				return
+			}
+		}
+	}
+
+	m.vp.Height = contentH
 	selStyle := lipgloss.NewStyle().Background(lipgloss.Color("237")).Foreground(lipgloss.Color("252"))
 	for i := range lines {
 		if i == m.previewSelLine {
@@ -1007,10 +1048,22 @@ func (m *Model) applyPreviewContent() {
 		}
 	}
 	m.vp.SetContent(strings.Join(lines, "\n"))
-	m.ensurePreviewScrollVisible()
+	m.ensurePreviewScrollVisibleFull()
 }
 
-func (m *Model) ensurePreviewScrollVisible() {
+func (m *Model) stylePreviewLinesAtGlobal(plain string, lineOffset int) string {
+	plain = strings.ReplaceAll(plain, "\r\n", "\n")
+	lines := strings.Split(plain, "\n")
+	selStyle := lipgloss.NewStyle().Background(lipgloss.Color("237")).Foreground(lipgloss.Color("252"))
+	for i := range lines {
+		if lineOffset+i == m.previewSelLine {
+			lines[i] = selStyle.Render(lines[i])
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *Model) ensurePreviewScrollVisibleFull() {
 	n := m.vp.TotalLineCount()
 	if n == 0 {
 		return
@@ -1020,6 +1073,25 @@ func (m *Model) ensurePreviewScrollVisible() {
 		return
 	}
 	y := m.previewSelLine
+	if y < m.vp.YOffset {
+		m.vp.SetYOffset(y)
+	}
+	if y >= m.vp.YOffset+h {
+		m.vp.SetYOffset(y - h + 1)
+	}
+}
+
+func (m *Model) ensurePreviewScrollVisibleSplit(treeStart int) {
+	if m.previewSelLine < treeStart {
+		m.vp.SetYOffset(0)
+		return
+	}
+	y := m.previewSelLine - treeStart
+	n := m.vp.TotalLineCount()
+	h := m.vp.Height
+	if n == 0 || h <= 0 {
+		return
+	}
 	if y < m.vp.YOffset {
 		m.vp.SetYOffset(y)
 	}
@@ -1059,6 +1131,21 @@ func (m *Model) renderSnapshot(path string, s snapshot) string {
 	now := time.Now()
 	var b strings.Builder
 	b.WriteString(m.snapshotHeaderBeforeTree(path, s))
+	webBase, _ := gitx.GitHubWebBase(path)
+	b.WriteString(m.renderBranchTree(path, s, now, webBase))
+	if s.ghErr != "" {
+		fmt.Fprintf(&b, "\n  %s\n", s.ghErr)
+		if hint := ghpr.AuthHint(); hint != "" {
+			fmt.Fprintf(&b, "  %s\n", hint)
+		}
+	}
+	return b.String()
+}
+
+// renderSnapshotScroll is the scrollable part of the preview (branch tree + gh errors), below the fixed header.
+func (m *Model) renderSnapshotScroll(path string, s snapshot) string {
+	now := time.Now()
+	var b strings.Builder
 	webBase, _ := gitx.GitHubWebBase(path)
 	b.WriteString(m.renderBranchTree(path, s, now, webBase))
 	if s.ghErr != "" {
@@ -1411,14 +1498,18 @@ func (m *Model) View() string {
 	if m.focus == focusTree {
 		leftBorder = lipgloss.Color("205")
 	}
+	paneInnerH := m.previewPaneH
+	if paneInnerH <= 0 {
+		paneInnerH = m.vp.Height
+	}
 	leftPane := lipgloss.NewStyle().
 		Border(border).
 		BorderForeground(leftBorder).
 		Width(m.leftColW).
-		Height(m.vp.Height + 2).
+		Height(paneInnerH + 2).
 		Render(left)
 
-	rightBody := m.vp.View()
+	rightBody := m.rightPreviewBody()
 	rightPane := lipgloss.NewStyle().
 		Border(border).
 		BorderForeground(func() lipgloss.Color {
@@ -1428,7 +1519,7 @@ func (m *Model) View() string {
 			return lipgloss.Color("240")
 		}()).
 		Width(m.vp.Width + 2).
-		Height(m.vp.Height + 2).
+		Height(paneInnerH + 2).
 		Render(rightBody)
 
 	row := lipgloss.JoinHorizontal(lipgloss.Top, leftPane, "  ", rightPane)
@@ -1450,6 +1541,12 @@ func (m *Model) View() string {
 
 	stack = append(stack, "", help)
 
-	// Leading newlines pad below host chrome / tab bar (increase if panes still clip).
-	return strings.Repeat("\n", 6) + lipgloss.JoinVertical(lipgloss.Left, stack...)
+	return lipgloss.JoinVertical(lipgloss.Left, stack...)
+}
+
+func (m *Model) rightPreviewBody() string {
+	if m.previewHeader != "" {
+		return lipgloss.JoinVertical(lipgloss.Left, m.previewHeader, m.vp.View())
+	}
+	return m.vp.View()
 }
