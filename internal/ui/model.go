@@ -48,6 +48,19 @@ type bulkSnapshotsMsg struct {
 	snaps map[string]snapshot
 }
 
+type archiveDoneMsg struct {
+	repo   string
+	branch string
+	err    error
+}
+
+// archiveConfirmDialog blocks the UI until the user confirms or cancels archive.
+type archiveConfirmDialog struct {
+	repo         string
+	branch       string
+	dontAskAgain bool
+}
+
 const preloadWorkers = 4
 
 // Model is the interactive browser state.
@@ -70,8 +83,11 @@ type Model struct {
 	cache             map[string]snapshot
 	branchExpanded    map[string]bool // key: repoAbs + "\x00" + folder Rel — preview branch tree folders
 	allRepos          []string        // every scanned repo path (for fetch + eager load)
-	width      int
-	height     int
+	prefs             Prefs
+	archiveConfirm    *archiveConfirmDialog
+	statusMsg         string
+	width             int
+	height            int
 }
 
 // New builds the TUI model. absRepos must be non-empty absolute paths under scanRoot.
@@ -88,6 +104,7 @@ func New(scanRoot string, absRepos []string, prLimit int) *Model {
 		allRepos: append([]string(nil), absRepos...),
 		// ~60% of the previous default (2/5): 0.4 * 0.6 = 0.24
 		leftFrac: 0.24,
+		prefs:    loadPrefs(),
 	}
 	m.rebuildRows()
 
@@ -404,6 +421,77 @@ func (m *Model) branchFolderAtPreviewLine() (repoAbs, folderRel string, ok bool)
 	return p, r.Rel, true
 }
 
+func (m *Model) branchAtPreviewLine() (repoAbs, branchFullName string, ok bool) {
+	p := m.selectedAbs()
+	if p == "" {
+		return "", "", false
+	}
+	snap, have := m.cache[p]
+	if !have {
+		return "", "", false
+	}
+	start := m.branchTreeContentStartLine(p, snap)
+	rows, _ := m.branchRowsAndUnmatched(p, snap)
+	if len(rows) == 0 {
+		return "", "", false
+	}
+	idx := m.previewSelLine - start
+	if idx < 0 || idx >= len(rows) {
+		return "", "", false
+	}
+	r := rows[idx]
+	if r.Kind != branchtree.RowBranch || r.U == nil {
+		return "", "", false
+	}
+	return p, r.U.FullName, true
+}
+
+func (m *Model) handleArchiveBranchRequest() (tea.Model, tea.Cmd) {
+	repo, branch, ok := m.branchAtPreviewLine()
+	if !ok {
+		return m, nil
+	}
+	m.statusMsg = ""
+	if m.prefs.SkipArchiveConfirm {
+		return m, m.runArchiveBranchCmd(repo, branch)
+	}
+	m.archiveConfirm = &archiveConfirmDialog{repo: repo, branch: branch}
+	return m, nil
+}
+
+func (m *Model) handleArchiveDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.archiveConfirm == nil {
+		return m, nil
+	}
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case " ":
+		m.archiveConfirm.dontAskAgain = !m.archiveConfirm.dontAskAgain
+		return m, nil
+	case "y", "Y", "enter":
+		d := m.archiveConfirm
+		m.archiveConfirm = nil
+		if d.dontAskAgain {
+			m.prefs.SkipArchiveConfirm = true
+			_ = savePrefs(m.prefs)
+		}
+		return m, m.runArchiveBranchCmd(d.repo, d.branch)
+	case "n", "N", "esc", "q":
+		m.archiveConfirm = nil
+		return m, nil
+	default:
+		return m, nil
+	}
+}
+
+func (m *Model) runArchiveBranchCmd(repo, branch string) tea.Cmd {
+	return func() tea.Msg {
+		err := gitx.ArchiveBranch(repo, branch)
+		return archiveDoneMsg{repo: repo, branch: branch, err: err}
+	}
+}
+
 // Update implements tea.Model.
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -432,8 +520,23 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyPreviewContent()
 		return m, nil
 
+	case archiveDoneMsg:
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("Archive failed: %v", msg.err)
+		} else {
+			m.statusMsg = fmt.Sprintf("Archived %s", msg.branch)
+		}
+		delete(m.cache, msg.repo)
+		return m, loadSnapshot(msg.repo, m.prLimit)
+
 	case tea.KeyMsg:
+		if m.archiveConfirm != nil {
+			return m.handleArchiveDialogKey(msg)
+		}
 		switch msg.String() {
+		case "A", "shift+a":
+			// Terminals usually send "A" for Shift+A (not "shift+a").
+			return m.handleArchiveBranchRequest()
 		case "shift+left":
 			m.leftFrac -= 0.02
 			if m.leftFrac < 0.12 {
@@ -909,6 +1012,30 @@ func truncateRunes(s string, max int) string {
 	return string(runes[:max-1]) + "…"
 }
 
+func (m *Model) renderArchiveDialog() string {
+	if m.archiveConfirm == nil {
+		return ""
+	}
+	d := m.archiveConfirm
+	onoff := "off"
+	if d.dontAskAgain {
+		onoff = "on"
+	}
+	w := m.width - 4
+	if w > 100 {
+		w = 100
+	}
+	body := fmt.Sprintf(
+		"Archive branch %s?\n\nCreate tag %q at the branch tip, push the tag, then delete the branch on origin and locally.\n\n[y] confirm   [n] cancel   [space] don't ask again (%s)",
+		d.branch, d.branch, onoff)
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("205")).
+		Padding(1, 2).
+		Width(w).
+		Render(body)
+}
+
 // View implements tea.Model.
 func (m *Model) View() string {
 	if m.width == 0 {
@@ -942,10 +1069,21 @@ func (m *Model) View() string {
 
 	row := lipgloss.JoinHorizontal(lipgloss.Top, leftPane, "  ", rightPane)
 
+	var stack []string
+	stack = append(stack, row)
+	if dlg := m.renderArchiveDialog(); dlg != "" {
+		stack = append(stack, "", dlg)
+	}
+	if m.statusMsg != "" {
+		stack = append(stack, "", lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render(m.statusMsg))
+	}
+
 	help := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("241")).
-		Render("tab: tree ↔ preview (↑/↓ · enter link · space: branch folder · f/pgdn scroll) · shift+←/→ · space (tree: repo folder) · g/G · r · q · startup: fetch --prune + preload")
+		Render("tab: tree ↔ preview (↑/↓ · enter link · shift+A archive branch · space: branch folder · f/pgdn) · shift+←/→ · space (tree) · g/G · r · q · startup: fetch --prune + preload")
+
+	stack = append(stack, "", help)
 
 	// Leading newline avoids the first row sitting under the terminal/IDE chrome in some hosts.
-	return "\n" + lipgloss.JoinVertical(lipgloss.Left, row, "", help)
+	return "\n" + lipgloss.JoinVertical(lipgloss.Left, stack...)
 }
