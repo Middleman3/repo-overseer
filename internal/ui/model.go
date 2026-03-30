@@ -70,9 +70,10 @@ type archiveConfirmDialog struct {
 
 // deleteConfirmDialog blocks the UI until the user confirms or cancels branch delete.
 type deleteConfirmDialog struct {
-	repo         string
-	branch       string
-	dontAskAgain bool
+	repo          string
+	branch        string
+	dontAskAgain  bool
+	switchToFirst string // if non-empty, branch is checked out; confirm checks this out before delete
 }
 
 type deleteDoneMsg struct {
@@ -686,11 +687,20 @@ func (m *Model) handleDeleteBranchRequest() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.statusMsg = ""
+	switchTo := ""
+	if gitx.CurrentBranch(repo) == branch {
+		t, err := gitx.DefaultBranchToCheckout(repo, branch)
+		if err != nil {
+			m.statusMsg = fmt.Sprintf("Cannot delete: %v", err)
+			return m, nil
+		}
+		switchTo = t
+	}
 	pl, pok := m.capturePendingPreviewAfterBranchRemoval(repo)
 	if m.prefs.SkipDeleteConfirm {
-		return m, m.runDeleteBranchCmd(repo, branch, pl, pok)
+		return m, m.runDeleteBranchCmd(repo, branch, switchTo, pl, pok)
 	}
-	m.deleteConfirm = &deleteConfirmDialog{repo: repo, branch: branch}
+	m.deleteConfirm = &deleteConfirmDialog{repo: repo, branch: branch, switchToFirst: switchTo}
 	return m, nil
 }
 
@@ -712,7 +722,7 @@ func (m *Model) handleDeleteDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.prefs.SkipDeleteConfirm = true
 			_ = savePrefs(m.prefs)
 		}
-		return m, m.runDeleteBranchCmd(d.repo, d.branch, pl, pok)
+		return m, m.runDeleteBranchCmd(d.repo, d.branch, d.switchToFirst, pl, pok)
 	case "n", "N", "esc", "q":
 		m.deleteConfirm = nil
 		return m, nil
@@ -721,9 +731,9 @@ func (m *Model) handleDeleteDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
-func (m *Model) runDeleteBranchCmd(repo, branch string, pendingLine int, pendingOk bool) tea.Cmd {
+func (m *Model) runDeleteBranchCmd(repo, branch, switchToFirst string, pendingLine int, pendingOk bool) tea.Cmd {
 	return func() tea.Msg {
-		err := gitx.DeleteBranch(repo, branch)
+		err := gitx.DeleteBranch(repo, branch, switchToFirst)
 		return deleteDoneMsg{repo: repo, branch: branch, err: err, pendingLine: pendingLine, pendingOk: pendingOk}
 	}
 }
@@ -1372,9 +1382,16 @@ func (m *Model) renderDeleteDialog() string {
 	if w > 100 {
 		w = 100
 	}
-	body := fmt.Sprintf(
-		"Delete branch %s on origin and locally?\n\nThis does not create a tag (unlike archive). [y] confirm   [n] cancel   [space] don't ask again (%s)",
-		d.branch, onoff)
+	var body string
+	if d.switchToFirst != "" {
+		body = fmt.Sprintf(
+			"Delete branch %s on origin and locally?\n\nYou have this branch checked out. Confirming will check out %q first, then remove the branch.\n\nThis does not create a tag (unlike archive).\n\n[y] confirm   [n] cancel   [space] don't ask again (%s)",
+			d.branch, d.switchToFirst, onoff)
+	} else {
+		body = fmt.Sprintf(
+			"Delete branch %s on origin and locally?\n\nThis does not create a tag (unlike archive). [y] confirm   [n] cancel   [space] don't ask again (%s)",
+			d.branch, onoff)
+	}
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("203")).
