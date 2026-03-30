@@ -31,6 +31,7 @@ type snapshot struct {
 	current string
 	unified []gitx.UnifiedBranch
 	prs     []ghpr.PR
+	tags    []string // all lightweight tags (e.g. archive tags)
 	gitErr  string
 	ghErr   string
 }
@@ -63,9 +64,10 @@ type checkoutDoneMsg struct {
 
 // archiveConfirmDialog blocks the UI until the user confirms or cancels archive.
 type archiveConfirmDialog struct {
-	repo         string
-	branch       string
-	dontAskAgain bool
+	repo          string
+	branch        string
+	dontAskAgain  bool
+	switchToFirst string // if non-empty, branch is checked out; confirm checks this out before archive
 }
 
 // deleteConfirmDialog blocks the UI until the user confirms or cancels branch delete.
@@ -91,6 +93,9 @@ type pushPRDoneMsg struct {
 }
 
 const preloadWorkers = 4
+
+// archivedTagsRel is the folder key for the collapsible "Archived tags" list (default collapsed).
+const archivedTagsRel = "__archived_tags__"
 
 // Model is the interactive browser state.
 type Model struct {
@@ -415,7 +420,7 @@ func (m *Model) previewBranchLineURLs(repoPath string, s snapshot, webBase strin
 	if !gitx.IsWorkTree(repoPath) {
 		return []string{""}
 	}
-	if len(s.unified) == 0 && len(s.prs) == 0 {
+	if len(s.unified) == 0 && len(s.prs) == 0 && len(s.tags) == 0 {
 		return []string{""}
 	}
 	rows, unmatched := m.branchRowsAndUnmatched(repoPath, s)
@@ -434,6 +439,8 @@ func (m *Model) previewBranchLineURLs(repoPath string, s snapshot, webBase strin
 				continue
 			}
 			urls = append(urls, r.PR.URL)
+		case branchtree.RowTag:
+			urls = append(urls, gitx.TagTreeURL(webBase, r.TagName))
 		}
 	}
 	if len(unmatched) > 0 {
@@ -450,6 +457,16 @@ func branchFolderKey(repoAbs, folderRel string) string {
 }
 
 func (m *Model) isBranchFolderExpanded(repoAbs, folderRel string) bool {
+	if folderRel == archivedTagsRel {
+		if m.branchExpanded == nil {
+			return false
+		}
+		v, ok := m.branchExpanded[branchFolderKey(repoAbs, folderRel)]
+		if !ok {
+			return false
+		}
+		return v
+	}
 	if m.branchExpanded == nil {
 		return true
 	}
@@ -491,7 +508,7 @@ func (m *Model) snapshotHeaderBeforeTree(path string, s snapshot) string {
 		}
 		b.WriteString("\n")
 	}
-	b.WriteString(lipgloss.NewStyle().Bold(true).Render("Branches & open PRs"))
+	b.WriteString(lipgloss.NewStyle().Bold(true).Render("Branches / PRs"))
 	b.WriteString("\n")
 	return b.String()
 }
@@ -563,6 +580,31 @@ func (m *Model) capturePendingPreviewAfterBranchRemoval(repo string) (pendingLin
 	return treeStart + newIdx, true
 }
 
+func (m *Model) appendArchivedTagRows(repoPath string, s snapshot, rows []branchtree.Row) []branchtree.Row {
+	if len(s.tags) == 0 {
+		return rows
+	}
+	rows = append(rows, branchtree.Row{
+		Kind:  branchtree.RowFolder,
+		Depth: 0,
+		Rel:   archivedTagsRel,
+		Label: "Archived tags",
+	})
+	if !m.isBranchFolderExpanded(repoPath, archivedTagsRel) {
+		return rows
+	}
+	for _, tag := range s.tags {
+		rows = append(rows, branchtree.Row{
+			Kind:    branchtree.RowTag,
+			Depth:   1,
+			Rel:     archivedTagsRel,
+			Label:   tag,
+			TagName: tag,
+		})
+	}
+	return rows
+}
+
 func (m *Model) branchRowsAndUnmatched(repoPath string, s snapshot) (rows []branchtree.Row, unmatched []ghpr.PR) {
 	if s.gitErr != "" {
 		return nil, nil
@@ -570,18 +612,21 @@ func (m *Model) branchRowsAndUnmatched(repoPath string, s snapshot) (rows []bran
 	if !gitx.IsWorkTree(repoPath) {
 		return nil, nil
 	}
-	if len(s.unified) == 0 && len(s.prs) == 0 {
+	if len(s.unified) == 0 && len(s.prs) == 0 && len(s.tags) == 0 {
 		return nil, nil
 	}
-	root := branchtree.Build(s.unified)
-	var prs []ghpr.PR
-	if s.ghErr == "" {
-		prs = s.prs
+	if len(s.unified) > 0 || len(s.prs) > 0 {
+		root := branchtree.Build(s.unified)
+		var prs []ghpr.PR
+		if s.ghErr == "" {
+			prs = s.prs
+		}
+		unmatched = branchtree.AssignPRs(root, prs)
+		branchtree.Flatten(root, 0, func(rel string) bool {
+			return m.isBranchFolderExpanded(repoPath, rel)
+		}, &rows)
 	}
-	unmatched = branchtree.AssignPRs(root, prs)
-	branchtree.Flatten(root, 0, func(rel string) bool {
-		return m.isBranchFolderExpanded(repoPath, rel)
-	}, &rows)
+	rows = m.appendArchivedTagRows(repoPath, s, rows)
 	return rows, unmatched
 }
 
@@ -656,11 +701,20 @@ func (m *Model) handleArchiveBranchRequest() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.statusMsg = ""
+	switchTo := ""
+	if gitx.CurrentBranch(repo) == branch {
+		t, err := gitx.DefaultBranchToCheckout(repo, branch)
+		if err != nil {
+			m.statusMsg = fmt.Sprintf("Cannot archive: %v", err)
+			return m, nil
+		}
+		switchTo = t
+	}
 	pl, pok := m.capturePendingPreviewAfterBranchRemoval(repo)
 	if m.prefs.SkipArchiveConfirm {
-		return m, m.runArchiveBranchCmd(repo, branch, pl, pok)
+		return m, m.runArchiveBranchCmd(repo, branch, switchTo, pl, pok)
 	}
-	m.archiveConfirm = &archiveConfirmDialog{repo: repo, branch: branch}
+	m.archiveConfirm = &archiveConfirmDialog{repo: repo, branch: branch, switchToFirst: switchTo}
 	return m, nil
 }
 
@@ -682,7 +736,7 @@ func (m *Model) handleArchiveDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.prefs.SkipArchiveConfirm = true
 			_ = savePrefs(m.prefs)
 		}
-		return m, m.runArchiveBranchCmd(d.repo, d.branch, pl, pok)
+		return m, m.runArchiveBranchCmd(d.repo, d.branch, d.switchToFirst, pl, pok)
 	case "n", "N", "esc", "q":
 		m.archiveConfirm = nil
 		return m, nil
@@ -691,9 +745,9 @@ func (m *Model) handleArchiveDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
-func (m *Model) runArchiveBranchCmd(repo, branch string, pendingLine int, pendingOk bool) tea.Cmd {
+func (m *Model) runArchiveBranchCmd(repo, branch, switchToFirst string, pendingLine int, pendingOk bool) tea.Cmd {
 	return func() tea.Msg {
-		err := gitx.ArchiveBranch(repo, branch)
+		err := gitx.ArchiveBranch(repo, branch, switchToFirst)
 		return archiveDoneMsg{repo: repo, branch: branch, err: err, pendingLine: pendingLine, pendingOk: pendingOk}
 	}
 }
@@ -1035,7 +1089,7 @@ func (m *Model) applyPreviewContent() {
 		m.previewSelLine = nEff - 1
 	}
 
-	// Repo with snapshot: fixed header (repo, checked out, worktrees, "Branches & open PRs") +
+	// Repo with snapshot: fixed header (repo, checked out, worktrees, "Branches / PRs") +
 	// scrollable branch list so the header is never scrolled off-screen.
 	if p != "" {
 		if snap, ok := m.cache[p]; ok {
@@ -1181,7 +1235,7 @@ func (m *Model) renderBranchTree(repoPath string, s snapshot, now time.Time, web
 	if !gitx.IsWorkTree(repoPath) {
 		return "  (not a normal work tree)\n"
 	}
-	if len(s.unified) == 0 && len(s.prs) == 0 {
+	if len(s.unified) == 0 && len(s.prs) == 0 && len(s.tags) == 0 {
 		return "  (no branches)\n"
 	}
 	rows, unmatched := m.branchRowsAndUnmatched(repoPath, s)
@@ -1220,6 +1274,12 @@ func (m *Model) renderBranchTree(repoPath string, s snapshot, now time.Time, web
 			head := fmt.Sprintf("#%d", pr.Number)
 			head = m.linkText(pr.URL, head)
 			fmt.Fprintf(&out, "%s◦ %s %s  %s  %s\n", ind, head, title, ghpr.FormatPRTagLine(*pr), lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render(opened))
+		case branchtree.RowTag:
+			label := r.Label
+			if u := gitx.TagTreeURL(webBase, r.TagName); u != "" {
+				label = m.linkText(u, r.Label)
+			}
+			fmt.Fprintf(&out, "%s◦ %s\n", ind, label)
 		}
 	}
 	if len(unmatched) > 0 {
@@ -1311,6 +1371,9 @@ func buildSnapshot(path string, prLimit int) snapshot {
 			s.gitErr = err.Error()
 		} else {
 			s.unified = ub
+		}
+		if tags, err := gitx.ListTags(path); err == nil {
+			s.tags = tags
 		}
 	}
 	if err := ghpr.RepoViewable(path); err == nil {
@@ -1462,9 +1525,16 @@ func (m *Model) renderArchiveDialog() string {
 	if w > 100 {
 		w = 100
 	}
-	body := fmt.Sprintf(
-		"Archive branch %s?\n\nCreate tag %q at the branch tip, push the tag, then delete the branch on origin and locally.\n\n[y] confirm   [n] cancel   [space] don't ask again (%s)",
-		d.branch, d.branch, onoff)
+	var body string
+	if d.switchToFirst != "" {
+		body = fmt.Sprintf(
+			"Archive branch %s?\n\nYou have this branch checked out. Confirming will check out %q first, then create tag %q at the branch tip, push the tag, and delete the branch on origin and locally.\n\n[y] confirm   [n] cancel   [space] don't ask again (%s)",
+			d.branch, d.switchToFirst, d.branch, onoff)
+	} else {
+		body = fmt.Sprintf(
+			"Archive branch %s?\n\nCreate tag %q at the branch tip, push the tag, then delete the branch on origin and locally.\n\n[y] confirm   [n] cancel   [space] don't ask again (%s)",
+			d.branch, d.branch, onoff)
+	}
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("205")).
@@ -1549,7 +1619,15 @@ func (m *Model) View() string {
 		stack = append(stack, "", dlg)
 	}
 	if m.statusMsg != "" {
-		stack = append(stack, "", lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render(m.statusMsg))
+		statusW := m.width - 4
+		if statusW < 24 {
+			statusW = 24
+		}
+		stack = append(stack, "",
+			lipgloss.NewStyle().
+				Foreground(lipgloss.Color("214")).
+				Width(statusW).
+				Render(m.statusMsg))
 	}
 
 	help := lipgloss.NewStyle().

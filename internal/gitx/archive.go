@@ -8,14 +8,21 @@ import (
 
 // ArchiveBranch creates a tag named after the branch at the branch tip, pushes the tag,
 // then deletes the branch on origin (if present) and locally (if present).
-// Fails if that branch is currently checked out, or if a tag with the branch name already exists.
-func ArchiveBranch(repo, branch string) error {
+// If that branch is currently checked out and switchToIfCheckedOut is non-empty, it runs Checkout
+// first. If checked out and switchToIfCheckedOut is empty, it returns an error.
+// Fails if a tag with the branch name already exists.
+func ArchiveBranch(repo, branch, switchToIfCheckedOut string) error {
 	if branch == "" {
 		return fmt.Errorf("empty branch name")
 	}
 	cur := CurrentBranch(repo)
 	if cur == branch {
-		return fmt.Errorf("cannot archive: checked out on %q — switch to another branch first", branch)
+		if strings.TrimSpace(switchToIfCheckedOut) == "" {
+			return fmt.Errorf("cannot archive: checked out on %q — switch to another branch first", branch)
+		}
+		if err := Checkout(repo, switchToIfCheckedOut); err != nil {
+			return fmt.Errorf("checkout %q before archive: %w", switchToIfCheckedOut, err)
+		}
 	}
 
 	sha, err := resolveBranchTip(repo, branch)

@@ -31,16 +31,18 @@ const (
 	RowFolder RowKind = iota
 	RowBranch
 	RowPR
+	RowTag // lightweight tag (e.g. from archive); not a branch row
 )
 
 // Row is one visible line in the branch tree preview.
 type Row struct {
-	Kind  RowKind
-	Depth int
-	Rel   string // folder path key
-	Label string
-	U     *gitx.UnifiedBranch // only for RowBranch
-	PR    *ghpr.PR            // only for RowPR
+	Kind    RowKind
+	Depth   int
+	Rel     string // folder path key
+	Label   string
+	U       *gitx.UnifiedBranch // only for RowBranch
+	PR      *ghpr.PR            // only for RowPR
+	TagName string              // only for RowTag (full tag name)
 }
 
 // Build constructs a tree from unified branches (FullName uses / for nesting).

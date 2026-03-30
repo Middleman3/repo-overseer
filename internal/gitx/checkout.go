@@ -11,6 +11,9 @@ func Checkout(repo, branch string) error {
 	if strings.TrimSpace(branch) == "" {
 		return fmt.Errorf("empty branch name")
 	}
+	if CurrentBranch(repo) == branch {
+		return nil
+	}
 	cmd := gitCmd(repo, "switch", branch)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
