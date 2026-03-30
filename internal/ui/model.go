@@ -362,12 +362,27 @@ func (m *Model) handlePreviewKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m *Model) previewPlainLineCount() int {
-	plain := strings.ReplaceAll(m.previewForSelection(), "\r\n", "\n")
+// trimTrailingEmptyLines removes trailing "" entries from a Split result.
+// Rendered preview text often ends with "\n", which produces a fake extra line
+// and lets the cursor sit "below" the last visible row.
+func trimTrailingEmptyLines(lines []string) []string {
+	for len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
+}
+
+func (m *Model) previewEffectiveLineCount(plain string) int {
+	plain = strings.ReplaceAll(plain, "\r\n", "\n")
 	if plain == "" {
 		return 0
 	}
-	return len(strings.Split(plain, "\n"))
+	lines := trimTrailingEmptyLines(strings.Split(plain, "\n"))
+	return len(lines)
+}
+
+func (m *Model) previewPlainLineCount() int {
+	return m.previewEffectiveLineCount(m.previewForSelection())
 }
 
 func (m *Model) previewURLAtSelLine() string {
@@ -1006,7 +1021,8 @@ func (m *Model) applyPreviewContent() {
 	plain = strings.ReplaceAll(plain, "\r\n", "\n")
 	lines := strings.Split(plain, "\n")
 	n := len(lines)
-	if n == 0 {
+	nEff := len(trimTrailingEmptyLines(append([]string(nil), lines...)))
+	if n == 0 || nEff == 0 {
 		m.vp.Height = contentH
 		m.vp.SetContent(plain)
 		return
@@ -1014,8 +1030,9 @@ func (m *Model) applyPreviewContent() {
 	if m.previewSelLine < 0 {
 		m.previewSelLine = 0
 	}
-	if m.previewSelLine >= n {
-		m.previewSelLine = n - 1
+	// Do not allow selection on trailing blank lines from a terminal \n.
+	if m.previewSelLine >= nEff {
+		m.previewSelLine = nEff - 1
 	}
 
 	// Repo with snapshot: fixed header (repo, checked out, worktrees, "Branches & open PRs") +
