@@ -101,13 +101,33 @@ func ListWorktreesDetail(repo string) ([]WorktreeInfo, error) {
 	return infos, nil
 }
 
+// WorktreeHasLocalChanges reports whether worktreePath has a non-clean working tree
+// (modified, staged, or untracked files). Used to decide if remove needs --force.
+func WorktreeHasLocalChanges(worktreePath string) (bool, error) {
+	worktreePath = filepath.Clean(worktreePath)
+	if worktreePath == "" {
+		return false, fmt.Errorf("empty worktree path")
+	}
+	cmd := gitCmd(worktreePath, "status", "--porcelain")
+	out, err := cmd.Output()
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(string(out)) != "", nil
+}
+
 // RemoveWorktree runs git worktree remove from the primary (or any) worktree of the repo.
-func RemoveWorktree(primaryRepo, worktreePath string) error {
+// If force is true, runs with --force (required when the checkout has local modifications).
+func RemoveWorktree(primaryRepo, worktreePath string, force bool) error {
 	worktreePath = filepath.Clean(worktreePath)
 	if worktreePath == "" {
 		return fmt.Errorf("empty worktree path")
 	}
-	cmd := gitCmd(primaryRepo, "worktree", "remove", worktreePath)
+	args := []string{"worktree", "remove", worktreePath}
+	if force {
+		args = []string{"worktree", "remove", "--force", worktreePath}
+	}
+	cmd := gitCmd(primaryRepo, args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {

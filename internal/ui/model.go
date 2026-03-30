@@ -98,13 +98,15 @@ type worktreeRemoveDoneMsg struct {
 	err         error
 }
 
-// worktreeRemoveDialog is a one- or two-step confirm for removing a linked worktree.
+// worktreeRemoveDialog is a multi-step confirm for removing a linked worktree.
 type worktreeRemoveDialog struct {
-	primary     string
-	worktreeAbs string
-	branch      string // branch checked out in that worktree; empty if detached
-	riskDetail  string // non-empty => show second confirm after first yes
-	secondStep  bool   // when true, second warning dialog is active
+	primary        string
+	worktreeAbs    string
+	branch         string // branch checked out in that worktree; empty if detached
+	riskDetail     string // non-empty => show sync warning after first yes
+	syncSecondStep bool   // branch sync / push warning dialog
+	forceStep      bool   // dirty tree: confirm git worktree remove --force
+	worktreeDirty  bool   // modified or untracked files in that checkout
 }
 
 const preloadWorkers = 4
@@ -990,12 +992,18 @@ func (m *Model) handleRemoveWorktreeRequest(row branchtree.Row) (tea.Model, tea.
 	if worktreeRemoveNeedsExtraConfirm(branch, u) {
 		risk = worktreeRemoveRiskDetail(branch, u)
 	}
+	dirty := false
+	if d, err := gitx.WorktreeHasLocalChanges(row.WorktreeAbs); err == nil {
+		dirty = d
+	}
 	m.worktreeRemove = &worktreeRemoveDialog{
-		primary:     primary,
-		worktreeAbs: row.WorktreeAbs,
-		branch:      branch,
-		riskDetail:  risk,
-		secondStep:  false,
+		primary:        primary,
+		worktreeAbs:    row.WorktreeAbs,
+		branch:         branch,
+		riskDetail:     risk,
+		syncSecondStep: false,
+		forceStep:      false,
+		worktreeDirty:  dirty,
 	}
 	return m, nil
 }
@@ -1008,18 +1016,33 @@ func (m *Model) handleWorktreeRemoveDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cm
 	case "ctrl+c":
 		return m, tea.Quit
 	case "y", "Y", "enter":
-		if m.worktreeRemove.secondStep {
-			pri, wt := m.worktreeRemove.primary, m.worktreeRemove.worktreeAbs
+		d := m.worktreeRemove
+		if d.forceStep {
+			pri, wt := d.primary, d.worktreeAbs
 			m.worktreeRemove = nil
-			return m, m.runRemoveWorktreeCmd(pri, wt)
+			return m, m.runRemoveWorktreeCmd(pri, wt, true)
 		}
-		if m.worktreeRemove.riskDetail != "" {
-			m.worktreeRemove.secondStep = true
+		if d.syncSecondStep {
+			if d.worktreeDirty {
+				d.syncSecondStep = false
+				d.forceStep = true
+				return m, nil
+			}
+			pri, wt := d.primary, d.worktreeAbs
+			m.worktreeRemove = nil
+			return m, m.runRemoveWorktreeCmd(pri, wt, false)
+		}
+		if d.riskDetail != "" {
+			d.syncSecondStep = true
 			return m, nil
 		}
-		pri, wt := m.worktreeRemove.primary, m.worktreeRemove.worktreeAbs
+		if d.worktreeDirty {
+			d.forceStep = true
+			return m, nil
+		}
+		pri, wt := d.primary, d.worktreeAbs
 		m.worktreeRemove = nil
-		return m, m.runRemoveWorktreeCmd(pri, wt)
+		return m, m.runRemoveWorktreeCmd(pri, wt, false)
 	case "n", "N", "esc", "q":
 		m.worktreeRemove = nil
 		return m, nil
@@ -1028,9 +1051,9 @@ func (m *Model) handleWorktreeRemoveDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cm
 	}
 }
 
-func (m *Model) runRemoveWorktreeCmd(primary, worktreeAbs string) tea.Cmd {
+func (m *Model) runRemoveWorktreeCmd(primary, worktreeAbs string, force bool) tea.Cmd {
 	return func() tea.Msg {
-		err := gitx.RemoveWorktree(primary, worktreeAbs)
+		err := gitx.RemoveWorktree(primary, worktreeAbs, force)
 		return worktreeRemoveDoneMsg{snapshotKey: primary, err: err}
 	}
 }
@@ -1822,7 +1845,13 @@ func (m *Model) renderWorktreeRemoveDialog() string {
 	}
 	pathLabel := m.relDisplay(d.worktreeAbs)
 	var body string
-	if d.secondStep {
+	switch {
+	case d.forceStep:
+		body = fmt.Sprintf(
+			"This checkout has modified, staged, or untracked files. Git requires --force to drop the worktree link.\n\nThat is separate from whether the branch is merged on the remote: local files still block a normal remove.\n\nForce-remove worktree %q? (Uncommitted files there may be deleted with the directory; the branch on origin is unchanged.)\n\n[y] confirm   [n] cancel",
+			pathLabel,
+		)
+	case d.syncSecondStep:
 		head := fmt.Sprintf("Branch %q is not fully pushed or not up to date with origin.", d.branch)
 		if strings.TrimSpace(d.branch) == "" {
 			head = "This worktree is not on a named branch or sync status is unknown."
@@ -1833,10 +1862,15 @@ func (m *Model) renderWorktreeRemoveDialog() string {
 			d.riskDetail,
 			pathLabel,
 		)
-	} else {
+	default:
+		hint := ""
+		if d.worktreeDirty {
+			hint = "\n\nThis checkout has local changes; you will be asked to confirm a force remove next."
+		}
 		body = fmt.Sprintf(
-			"Remove linked worktree %q?\n\nThis runs git worktree remove. Uncommitted changes in that checkout can make the command fail.\n\n[y] confirm   [n] cancel",
+			"Remove linked worktree %q?\n\nThis detaches the extra checkout from the repo (git worktree remove).%s\n\n[y] confirm   [n] cancel",
 			pathLabel,
+			hint,
 		)
 	}
 	return lipgloss.NewStyle().
