@@ -9,6 +9,10 @@ import (
 // Prefs are persisted under the user config dir (e.g. ~/.config/nested-git-tui/config.json on Linux).
 type Prefs struct {
 	SkipArchiveConfirm bool `json:"skip_archive_confirm"`
+	// ShowPreviewLinks enables OSC 8 hyperlinks in the preview (off by default; press L to toggle).
+	ShowPreviewLinks bool `json:"show_preview_links"`
+	// SkipDeleteConfirm skips the delete-branch confirmation dialog when true.
+	SkipDeleteConfirm bool `json:"skip_delete_confirm"`
 }
 
 func prefsPath() (string, error) {

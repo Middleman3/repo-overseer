@@ -145,7 +145,8 @@ func (d *Dir) sortPRs() {
 	}
 }
 
-// Flatten walks folders then branches (depth-first); PRs are nested under their branch.
+// Flatten walks folders then branches (depth-first). When a leaf has open PRs, PR rows
+// replace the branch line at the same depth; otherwise the branch row is shown.
 // isExpanded(rel) returns whether folder rel should show its children; if nil, all folders are expanded.
 func Flatten(d *Dir, depth int, isExpanded func(string) bool, out *[]Row) {
 	if isExpanded == nil {
@@ -163,19 +164,25 @@ func Flatten(d *Dir, depth int, isExpanded func(string) bool, out *[]Row) {
 		}
 	}
 	for _, leaf := range d.Leaves {
+		if len(leaf.PRs) > 0 {
+			// Open PRs replace the branch line (same depth as the branch would use).
+			for i := range leaf.PRs {
+				pr := &leaf.PRs[i]
+				*out = append(*out, Row{
+					Kind:  RowPR,
+					Depth: depth,
+					Label: leaf.Name,
+					U:     leaf.U,
+					PR:    pr,
+				})
+			}
+			continue
+		}
 		*out = append(*out, Row{
 			Kind:  RowBranch,
 			Depth: depth,
 			Label: leaf.Name,
 			U:     leaf.U,
 		})
-		for i := range leaf.PRs {
-			pr := &leaf.PRs[i]
-			*out = append(*out, Row{
-				Kind:  RowPR,
-				Depth: depth + 1,
-				PR:    pr,
-			})
-		}
 	}
 }

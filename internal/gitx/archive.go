@@ -36,7 +36,8 @@ func ArchiveBranch(repo, branch string) error {
 	}
 
 	stderr.Reset()
-	cmd = gitCmd(repo, "push", "origin", tag)
+	// Push tag with an explicit ref so it cannot be confused with a branch of the same name.
+	cmd = gitCmd(repo, "push", "origin", "refs/tags/"+tag)
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		_ = gitCmd(repo, "tag", "-d", tag).Run()
@@ -45,7 +46,8 @@ func ArchiveBranch(repo, branch string) error {
 
 	if remoteBranchExists(repo, branch) {
 		stderr.Reset()
-		cmd = gitCmd(repo, "push", "origin", "--delete", branch)
+		// After the tag exists on the remote, a bare name matches both branch and tag — use refs/heads/.
+		cmd = gitCmd(repo, "push", "origin", "--delete", "refs/heads/"+branch)
 		cmd.Stderr = &stderr
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("delete remote branch: %w: %s", err, strings.TrimSpace(stderr.String()))

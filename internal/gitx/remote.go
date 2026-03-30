@@ -52,6 +52,15 @@ func remoteGetURL(repo, name string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// RepoBranchesAllURL returns the GitHub "all branches" page URL, or "" if not GitHub.
+func RepoBranchesAllURL(repo string) string {
+	base, err := GitHubWebBase(repo)
+	if err != nil || base == "" {
+		return ""
+	}
+	return base + "/branches/all"
+}
+
 // BranchTreeURL returns the GitHub tree URL for a branch name, or "" if base is empty.
 func BranchTreeURL(webBase, branch string) string {
 	if webBase == "" || branch == "" {

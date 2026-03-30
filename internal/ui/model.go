@@ -49,9 +49,16 @@ type bulkSnapshotsMsg struct {
 }
 
 type archiveDoneMsg struct {
-	repo   string
-	branch string
-	err    error
+	repo        string
+	branch      string
+	err         error
+	pendingLine int
+	pendingOk   bool
+}
+
+type checkoutDoneMsg struct {
+	repo string
+	err  error
 }
 
 // archiveConfirmDialog blocks the UI until the user confirms or cancels archive.
@@ -61,33 +68,57 @@ type archiveConfirmDialog struct {
 	dontAskAgain bool
 }
 
+// deleteConfirmDialog blocks the UI until the user confirms or cancels branch delete.
+type deleteConfirmDialog struct {
+	repo         string
+	branch       string
+	dontAskAgain bool
+}
+
+type deleteDoneMsg struct {
+	repo        string
+	branch      string
+	err         error
+	pendingLine int
+	pendingOk   bool
+}
+
+type pushPRDoneMsg struct {
+	repo   string
+	branch string
+	err    error
+}
+
 const preloadWorkers = 4
 
 // Model is the interactive browser state.
 type Model struct {
-	scanRoot   string
-	prLimit    int
-	tr         *tree.Dir
-	expanded   map[string]bool
-	rows       []tree.Row
-	cursor     int
-	scroll     int
-	treeInnerH int
-	leftInnerW int
-	leftColW   int
-	leftFrac          float64 // fraction of total width for the left sidebar (Shift+←/→ adjusts)
-	vp                viewport.Model
-	previewSelLine    int
-	lastPreviewRowKey string // tree.RowKind + Rel — reset line when selection changes
-	focus             focus
-	cache             map[string]snapshot
-	branchExpanded    map[string]bool // key: repoAbs + "\x00" + folder Rel — preview branch tree folders
-	allRepos          []string        // every scanned repo path (for fetch + eager load)
-	prefs             Prefs
-	archiveConfirm    *archiveConfirmDialog
-	statusMsg         string
-	width             int
-	height            int
+	scanRoot           string
+	prLimit            int
+	tr                 *tree.Dir
+	expanded           map[string]bool
+	rows               []tree.Row
+	cursor             int
+	scroll             int
+	treeInnerH         int
+	leftInnerW         int
+	leftColW           int
+	leftFrac           float64 // fraction of total width for the left sidebar (Shift+←/→ adjusts)
+	vp                 viewport.Model
+	previewSelLine     int
+	lastPreviewRowKey  string // tree.RowKind + Rel — reset line when selection changes
+	focus              focus
+	cache              map[string]snapshot
+	branchExpanded     map[string]bool // key: repoAbs + "\x00" + folder Rel — preview branch tree folders
+	allRepos           []string        // every scanned repo path (for fetch + eager load)
+	prefs              Prefs
+	archiveConfirm     *archiveConfirmDialog
+	deleteConfirm      *deleteConfirmDialog
+	statusMsg          string
+	width              int
+	height             int
+	pendingPreviewRepo string // repo path; cleared after snapshotMsg applies pending line
+	pendingPreviewLine int    // absolute preview line; -1 means none
 }
 
 // New builds the TUI model. absRepos must be non-empty absolute paths under scanRoot.
@@ -116,6 +147,7 @@ func New(scanRoot string, absRepos []string, prLimit int) *Model {
 	)
 	m.vp.KeyMap = km
 	m.lastPreviewRowKey = m.currentRowKey()
+	m.pendingPreviewLine = -1
 
 	return m
 }
@@ -237,6 +269,19 @@ func (m *Model) handleTreeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+	case "enter":
+		if m.cursor >= 0 && m.cursor < len(m.rows) {
+			r := m.rows[m.cursor]
+			if r.Kind == tree.RowRepo {
+				u := gitx.RepoBranchesAllURL(r.Abs)
+				if u == "" {
+					m.statusMsg = "GitHub branches page not available (need github.com origin)."
+					return m, nil
+				}
+				return m, openURLCmd(u)
+			}
+		}
+		return m, nil
 	}
 	return m, nil
 }
@@ -299,6 +344,12 @@ func (m *Model) handlePreviewKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.toggleBranchFolder(repo, rel)
 		m.applyPreviewContent()
 		return m, nil
+	case "c", "C":
+		return m.handleCheckoutRequest()
+	case "d", "D":
+		return m.handleDeleteBranchRequest()
+	case "p", "P":
+		return m.handlePushPRRequest()
 	}
 	var cmd tea.Cmd
 	m.vp, cmd = m.vp.Update(msg)
@@ -314,12 +365,63 @@ func (m *Model) previewPlainLineCount() int {
 }
 
 func (m *Model) previewURLAtSelLine() string {
-	plain := strings.ReplaceAll(m.previewForSelection(), "\r\n", "\n")
-	lines := strings.Split(plain, "\n")
-	if m.previewSelLine < 0 || m.previewSelLine >= len(lines) {
+	p := m.selectedAbs()
+	if p == "" {
 		return ""
 	}
-	return FirstOSC8URL(lines[m.previewSelLine])
+	snap, ok := m.cache[p]
+	if !ok {
+		return ""
+	}
+	start := m.branchTreeContentStartLine(p, snap)
+	idx := m.previewSelLine - start
+	if idx < 0 {
+		return ""
+	}
+	webBase, _ := gitx.GitHubWebBase(p)
+	urls := m.previewBranchLineURLs(p, snap, webBase)
+	if idx >= len(urls) {
+		return ""
+	}
+	return urls[idx]
+}
+
+// previewBranchLineURLs returns one URL per rendered line in renderBranchTree (same order, including skips).
+func (m *Model) previewBranchLineURLs(repoPath string, s snapshot, webBase string) []string {
+	if s.gitErr != "" {
+		return []string{""}
+	}
+	if !gitx.IsWorkTree(repoPath) {
+		return []string{""}
+	}
+	if len(s.unified) == 0 && len(s.prs) == 0 {
+		return []string{""}
+	}
+	rows, unmatched := m.branchRowsAndUnmatched(repoPath, s)
+	var urls []string
+	for _, r := range rows {
+		switch r.Kind {
+		case branchtree.RowFolder:
+			urls = append(urls, "")
+		case branchtree.RowBranch:
+			if r.U == nil {
+				continue
+			}
+			urls = append(urls, gitx.BranchTreeURL(webBase, r.U.FullName))
+		case branchtree.RowPR:
+			if r.PR == nil {
+				continue
+			}
+			urls = append(urls, r.PR.URL)
+		}
+	}
+	if len(unmatched) > 0 {
+		urls = append(urls, "")
+		for i := range unmatched {
+			urls = append(urls, unmatched[i].URL)
+		}
+	}
+	return urls
 }
 
 func branchFolderKey(repoAbs, folderRel string) string {
@@ -369,6 +471,50 @@ func firstLineIndexAfterHeader(header string) int {
 
 func (m *Model) branchTreeContentStartLine(path string, s snapshot) int {
 	return firstLineIndexAfterHeader(m.snapshotHeaderBeforeTree(path, s))
+}
+
+func nextPreviewLineAfterRemoval(deletedIdx, oldCount int) int {
+	if oldCount <= 1 {
+		return 0
+	}
+	if deletedIdx < oldCount-1 {
+		return deletedIdx
+	}
+	return deletedIdx - 1
+}
+
+func stringLineCount(s string) int {
+	s = strings.TrimSuffix(s, "\n")
+	if s == "" {
+		return 0
+	}
+	return strings.Count(s, "\n") + 1
+}
+
+// capturePendingPreviewAfterBranchRemoval returns the preview line to select after removing one
+// branch-tree row (same visual index semantics as renderBranchTree output).
+func (m *Model) capturePendingPreviewAfterBranchRemoval(repo string) (pendingLine int, pendingOk bool) {
+	p := m.selectedAbs()
+	if p != repo {
+		return 0, false
+	}
+	snap, ok := m.cache[p]
+	if !ok {
+		return 0, false
+	}
+	treeStart := m.branchTreeContentStartLine(p, snap)
+	webBase, _ := gitx.GitHubWebBase(p)
+	branchBlob := m.renderBranchTree(p, snap, time.Now(), webBase)
+	visualLines := stringLineCount(branchBlob)
+	if visualLines == 0 {
+		return 0, false
+	}
+	deletedIdx := m.previewSelLine - treeStart
+	if deletedIdx < 0 || deletedIdx >= visualLines {
+		return 0, false
+	}
+	newIdx := nextPreviewLineAfterRemoval(deletedIdx, visualLines)
+	return treeStart + newIdx, true
 }
 
 func (m *Model) branchRowsAndUnmatched(repoPath string, s snapshot) (rows []branchtree.Row, unmatched []ghpr.PR) {
@@ -421,7 +567,9 @@ func (m *Model) branchFolderAtPreviewLine() (repoAbs, folderRel string, ok bool)
 	return p, r.Rel, true
 }
 
-func (m *Model) branchAtPreviewLine() (repoAbs, branchFullName string, ok bool) {
+// selectedPreviewBranchName returns the repo and branch to operate on when the preview
+// highlight is on a branch row or a PR row (head branch).
+func (m *Model) selectedPreviewBranchName() (repoAbs, branch string, ok bool) {
 	p := m.selectedAbs()
 	if p == "" {
 		return "", "", false
@@ -440,20 +588,31 @@ func (m *Model) branchAtPreviewLine() (repoAbs, branchFullName string, ok bool) 
 		return "", "", false
 	}
 	r := rows[idx]
-	if r.Kind != branchtree.RowBranch || r.U == nil {
+	switch r.Kind {
+	case branchtree.RowBranch:
+		if r.U == nil {
+			return "", "", false
+		}
+		return p, r.U.FullName, true
+	case branchtree.RowPR:
+		if r.PR == nil {
+			return "", "", false
+		}
+		return p, ghpr.HeadBranchLocalName(r.PR.HeadRefName), true
+	default:
 		return "", "", false
 	}
-	return p, r.U.FullName, true
 }
 
 func (m *Model) handleArchiveBranchRequest() (tea.Model, tea.Cmd) {
-	repo, branch, ok := m.branchAtPreviewLine()
+	repo, branch, ok := m.selectedPreviewBranchName()
 	if !ok {
 		return m, nil
 	}
 	m.statusMsg = ""
+	pl, pok := m.capturePendingPreviewAfterBranchRemoval(repo)
 	if m.prefs.SkipArchiveConfirm {
-		return m, m.runArchiveBranchCmd(repo, branch)
+		return m, m.runArchiveBranchCmd(repo, branch, pl, pok)
 	}
 	m.archiveConfirm = &archiveConfirmDialog{repo: repo, branch: branch}
 	return m, nil
@@ -472,11 +631,12 @@ func (m *Model) handleArchiveDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "y", "Y", "enter":
 		d := m.archiveConfirm
 		m.archiveConfirm = nil
+		pl, pok := m.capturePendingPreviewAfterBranchRemoval(d.repo)
 		if d.dontAskAgain {
 			m.prefs.SkipArchiveConfirm = true
 			_ = savePrefs(m.prefs)
 		}
-		return m, m.runArchiveBranchCmd(d.repo, d.branch)
+		return m, m.runArchiveBranchCmd(d.repo, d.branch, pl, pok)
 	case "n", "N", "esc", "q":
 		m.archiveConfirm = nil
 		return m, nil
@@ -485,11 +645,98 @@ func (m *Model) handleArchiveDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
-func (m *Model) runArchiveBranchCmd(repo, branch string) tea.Cmd {
+func (m *Model) runArchiveBranchCmd(repo, branch string, pendingLine int, pendingOk bool) tea.Cmd {
 	return func() tea.Msg {
 		err := gitx.ArchiveBranch(repo, branch)
-		return archiveDoneMsg{repo: repo, branch: branch, err: err}
+		return archiveDoneMsg{repo: repo, branch: branch, err: err, pendingLine: pendingLine, pendingOk: pendingOk}
 	}
+}
+
+func (m *Model) handleDeleteBranchRequest() (tea.Model, tea.Cmd) {
+	repo, branch, ok := m.selectedPreviewBranchName()
+	if !ok {
+		return m, nil
+	}
+	m.statusMsg = ""
+	pl, pok := m.capturePendingPreviewAfterBranchRemoval(repo)
+	if m.prefs.SkipDeleteConfirm {
+		return m, m.runDeleteBranchCmd(repo, branch, pl, pok)
+	}
+	m.deleteConfirm = &deleteConfirmDialog{repo: repo, branch: branch}
+	return m, nil
+}
+
+func (m *Model) handleDeleteDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.deleteConfirm == nil {
+		return m, nil
+	}
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case " ":
+		m.deleteConfirm.dontAskAgain = !m.deleteConfirm.dontAskAgain
+		return m, nil
+	case "y", "Y", "enter":
+		d := m.deleteConfirm
+		m.deleteConfirm = nil
+		pl, pok := m.capturePendingPreviewAfterBranchRemoval(d.repo)
+		if d.dontAskAgain {
+			m.prefs.SkipDeleteConfirm = true
+			_ = savePrefs(m.prefs)
+		}
+		return m, m.runDeleteBranchCmd(d.repo, d.branch, pl, pok)
+	case "n", "N", "esc", "q":
+		m.deleteConfirm = nil
+		return m, nil
+	default:
+		return m, nil
+	}
+}
+
+func (m *Model) runDeleteBranchCmd(repo, branch string, pendingLine int, pendingOk bool) tea.Cmd {
+	return func() tea.Msg {
+		err := gitx.DeleteBranch(repo, branch)
+		return deleteDoneMsg{repo: repo, branch: branch, err: err, pendingLine: pendingLine, pendingOk: pendingOk}
+	}
+}
+
+func (m *Model) handleCheckoutRequest() (tea.Model, tea.Cmd) {
+	repo, branch, ok := m.selectedPreviewBranchName()
+	if !ok {
+		return m, nil
+	}
+	m.statusMsg = ""
+	return m, m.runCheckoutCmd(repo, branch)
+}
+
+func (m *Model) runCheckoutCmd(repo, branch string) tea.Cmd {
+	return func() tea.Msg {
+		err := gitx.Checkout(repo, branch)
+		return checkoutDoneMsg{repo: repo, err: err}
+	}
+}
+
+func (m *Model) handlePushPRRequest() (tea.Model, tea.Cmd) {
+	repo, branch, ok := m.selectedPreviewBranchName()
+	if !ok {
+		return m, nil
+	}
+	m.statusMsg = ""
+	return m, m.runPushPRCmd(repo, branch)
+}
+
+func (m *Model) runPushPRCmd(repo, branch string) tea.Cmd {
+	return func() tea.Msg {
+		err := gitx.PushCreatePR(repo, branch)
+		return pushPRDoneMsg{repo: repo, branch: branch, err: err}
+	}
+}
+
+func (m *Model) linkText(url, plain string) string {
+	if m.prefs.ShowPreviewLinks && url != "" {
+		return OSC8(url, plain)
+	}
+	return plain
 }
 
 // Update implements tea.Model.
@@ -504,7 +751,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case snapshotMsg:
 		m.cache[msg.path] = msg.snap
 		if m.selectedAbs() == msg.path {
-			m.previewSelLine = 0
+			if m.pendingPreviewRepo == msg.path && m.pendingPreviewLine >= 0 {
+				m.previewSelLine = m.pendingPreviewLine
+				m.pendingPreviewRepo = ""
+				m.pendingPreviewLine = -1
+			} else {
+				m.previewSelLine = 0
+			}
 			m.applyPreviewContent()
 		}
 		return m, nil
@@ -521,21 +774,62 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case archiveDoneMsg:
+		// Ensure modal is gone after async work (covers any missed confirm-path clear).
+		m.archiveConfirm = nil
 		if msg.err != nil {
 			m.statusMsg = fmt.Sprintf("Archive failed: %v", msg.err)
 		} else {
 			m.statusMsg = fmt.Sprintf("Archived %s", msg.branch)
+			if msg.pendingOk {
+				m.pendingPreviewRepo = msg.repo
+				m.pendingPreviewLine = msg.pendingLine
+			}
+		}
+		delete(m.cache, msg.repo)
+		return m, loadSnapshot(msg.repo, m.prLimit)
+
+	case checkoutDoneMsg:
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("Checkout failed: %v", msg.err)
+		} else {
+			m.statusMsg = "Checked out."
+		}
+		delete(m.cache, msg.repo)
+		return m, loadSnapshot(msg.repo, m.prLimit)
+
+	case deleteDoneMsg:
+		// Ensure modal is gone after async work (covers any missed confirm-path clear).
+		m.deleteConfirm = nil
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("Delete failed: %v", msg.err)
+		} else {
+			m.statusMsg = fmt.Sprintf("Deleted branch %s", msg.branch)
+			if msg.pendingOk {
+				m.pendingPreviewRepo = msg.repo
+				m.pendingPreviewLine = msg.pendingLine
+			}
+		}
+		delete(m.cache, msg.repo)
+		return m, loadSnapshot(msg.repo, m.prLimit)
+
+	case pushPRDoneMsg:
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("PR failed: %v", msg.err)
+		} else {
+			m.statusMsg = fmt.Sprintf("Opened PR for %s", msg.branch)
 		}
 		delete(m.cache, msg.repo)
 		return m, loadSnapshot(msg.repo, m.prLimit)
 
 	case tea.KeyMsg:
+		if m.deleteConfirm != nil {
+			return m.handleDeleteDialogKey(msg)
+		}
 		if m.archiveConfirm != nil {
 			return m.handleArchiveDialogKey(msg)
 		}
 		switch msg.String() {
-		case "A", "shift+a":
-			// Terminals usually send "A" for Shift+A (not "shift+a").
+		case "a", "A":
 			return m.handleArchiveBranchRequest()
 		case "shift+left":
 			m.leftFrac -= 0.02
@@ -553,12 +847,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "ctrl+c", "q":
 			return m, tea.Quit
-		case "tab":
+		case "tab", "shift+tab", "left", "right":
 			if m.focus == focusTree {
 				m.focus = focusPreview
 			} else {
 				m.focus = focusTree
 			}
+			return m, nil
+		case "l", "L":
+			m.prefs.ShowPreviewLinks = !m.prefs.ShowPreviewLinks
+			_ = savePrefs(m.prefs)
+			m.applyPreviewContent()
 			return m, nil
 		case "r":
 			p := m.selectedAbs()
@@ -760,7 +1059,7 @@ func (m *Model) renderBranchTree(repoPath string, s snapshot, now time.Time, web
 			}
 			label := r.Label
 			if u := gitx.BranchTreeURL(webBase, r.U.FullName); u != "" {
-				label = OSC8(u, label)
+				label = m.linkText(u, r.Label)
 			}
 			fmt.Fprintf(&out, "%s◦ %s  %s\n", ind, label, formatUnifiedBranchMeta(r.U, now))
 		case branchtree.RowPR:
@@ -774,13 +1073,11 @@ func (m *Model) renderBranchTree(repoPath string, s snapshot, now time.Time, web
 			}
 			title := pr.Title
 			if pr.URL != "" {
-				title = OSC8(pr.URL, title)
+				title = m.linkText(pr.URL, pr.Title)
 			}
 			head := fmt.Sprintf("#%d", pr.Number)
-			if pr.URL != "" {
-				head = OSC8(pr.URL, head)
-			}
-			fmt.Fprintf(&out, "%s  %s %s  %s  %s\n", ind, head, title, ghpr.FormatPRTagLine(*pr), lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render(opened))
+			head = m.linkText(pr.URL, head)
+			fmt.Fprintf(&out, "%s◦ %s %s  %s  %s\n", ind, head, title, ghpr.FormatPRTagLine(*pr), lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render(opened))
 		}
 	}
 	if len(unmatched) > 0 {
@@ -793,12 +1090,10 @@ func (m *Model) renderBranchTree(repoPath string, s snapshot, now time.Time, web
 			}
 			title := pr.Title
 			if pr.URL != "" {
-				title = OSC8(pr.URL, title)
+				title = m.linkText(pr.URL, pr.Title)
 			}
 			head := fmt.Sprintf("#%d", pr.Number)
-			if pr.URL != "" {
-				head = OSC8(pr.URL, head)
-			}
+			head = m.linkText(pr.URL, head)
 			fmt.Fprintf(&out, "  %s %s  %s  %s\n", head, title, ghpr.FormatPRTagLine(*pr), lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render(opened))
 		}
 	}
@@ -954,7 +1249,7 @@ func refreshRepoSnapshot(path string, prLimit int) tea.Cmd {
 
 func (m *Model) renderTreePanel() string {
 	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Render("Repositories")
-	sub := lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("Space: expand/collapse · j/k: move")
+	sub := lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("Space: expand/collapse · Enter: branches on GitHub · j/k: move")
 	header := lipgloss.JoinVertical(lipgloss.Left, title, sub)
 
 	var lines []string
@@ -1036,6 +1331,30 @@ func (m *Model) renderArchiveDialog() string {
 		Render(body)
 }
 
+func (m *Model) renderDeleteDialog() string {
+	if m.deleteConfirm == nil {
+		return ""
+	}
+	d := m.deleteConfirm
+	onoff := "off"
+	if d.dontAskAgain {
+		onoff = "on"
+	}
+	w := m.width - 4
+	if w > 100 {
+		w = 100
+	}
+	body := fmt.Sprintf(
+		"Delete branch %s on origin and locally?\n\nThis does not create a tag (unlike archive). [y] confirm   [n] cancel   [space] don't ask again (%s)",
+		d.branch, onoff)
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("203")).
+		Padding(1, 2).
+		Width(w).
+		Render(body)
+}
+
 // View implements tea.Model.
 func (m *Model) View() string {
 	if m.width == 0 {
@@ -1071,7 +1390,9 @@ func (m *Model) View() string {
 
 	var stack []string
 	stack = append(stack, row)
-	if dlg := m.renderArchiveDialog(); dlg != "" {
+	if dlg := m.renderDeleteDialog(); dlg != "" {
+		stack = append(stack, "", dlg)
+	} else if dlg := m.renderArchiveDialog(); dlg != "" {
 		stack = append(stack, "", dlg)
 	}
 	if m.statusMsg != "" {
@@ -1080,10 +1401,10 @@ func (m *Model) View() string {
 
 	help := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("241")).
-		Render("tab: tree ↔ preview (↑/↓ · enter link · shift+A archive branch · space: branch folder · f/pgdn) · shift+←/→ · space (tree) · g/G · r · q · startup: fetch --prune + preload")
+		Render("tab/shift+tab/←/→: panes · L: preview links · preview: ↑/↓ · enter URL · c checkout · d delete · a archive · p push/PR · space folder · f/pgdn · shift+←/→ width · tree enter: branches on GitHub · g/G · r · q")
 
 	stack = append(stack, "", help)
 
-	// Leading newline avoids the first row sitting under the terminal/IDE chrome in some hosts.
-	return "\n" + lipgloss.JoinVertical(lipgloss.Left, stack...)
+	// Leading newlines pad below host chrome / tab bar (increase if panes still clip).
+	return strings.Repeat("\n", 6) + lipgloss.JoinVertical(lipgloss.Left, stack...)
 }
