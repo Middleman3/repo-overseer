@@ -109,8 +109,9 @@ type Model struct {
 	lastPreviewRowKey  string // tree.RowKind + Rel — reset line when selection changes
 	focus              focus
 	cache              map[string]snapshot
-	branchExpanded     map[string]bool // key: repoAbs + "\x00" + folder Rel — preview branch tree folders
-	allRepos           []string        // every scanned repo path (for fetch + eager load)
+	branchExpanded     map[string]bool     // key: repoAbs + "\x00" + folder Rel — preview branch tree folders
+	allRepos           []string            // every scanned repo path (for fetch + eager load)
+	worktreesByRepo    map[string][]string // primary abs -> all linked worktree paths (primary first); nil if unknown
 	prefs              Prefs
 	archiveConfirm     *archiveConfirmDialog
 	deleteConfirm      *deleteConfirmDialog
@@ -121,18 +122,20 @@ type Model struct {
 	pendingPreviewLine int    // absolute preview line; -1 means none
 }
 
-// New builds the TUI model. absRepos must be non-empty absolute paths under scanRoot.
-func New(scanRoot string, absRepos []string, prLimit int) *Model {
+// New builds the TUI model. absRepos must be non-empty absolute paths under scanRoot (one per logical repo).
+// worktreesByPrimary maps each primary path to all linked worktree paths including the primary; nil is allowed.
+func New(scanRoot string, absRepos []string, worktreesByPrimary map[string][]string, prLimit int) *Model {
 	scanRoot = filepath.Clean(scanRoot)
 	tr := tree.Build(scanRoot, absRepos)
 	m := &Model{
-		scanRoot: scanRoot,
-		prLimit:  prLimit,
-		tr:       tr,
-		expanded: map[string]bool{},
-		focus:    focusTree,
-		cache:    map[string]snapshot{},
-		allRepos: append([]string(nil), absRepos...),
+		scanRoot:        scanRoot,
+		prLimit:         prLimit,
+		tr:              tr,
+		expanded:        map[string]bool{},
+		focus:           focusTree,
+		cache:           map[string]snapshot{},
+		allRepos:        append([]string(nil), absRepos...),
+		worktreesByRepo: worktreesByPrimary,
 		// ~60% of the previous default (2/5): 0.4 * 0.6 = 0.24
 		leftFrac: 0.24,
 		prefs:    loadPrefs(),
@@ -456,9 +459,34 @@ func (m *Model) snapshotHeaderBeforeTree(path string, s snapshot) string {
 	} else {
 		b.WriteString("Checked out: (detached or empty)\n\n")
 	}
+	wts := m.worktreesForRepo(path)
+	if len(wts) > 1 {
+		b.WriteString(lipgloss.NewStyle().Bold(true).Render("Worktrees"))
+		b.WriteString("\n")
+		for _, wt := range wts {
+			label := m.relDisplay(wt)
+			suffix := ""
+			if filepath.Clean(wt) == filepath.Clean(path) {
+				suffix = "  (primary)"
+			}
+			fmt.Fprintf(&b, "  ◦ %s%s\n", label, suffix)
+		}
+		b.WriteString("\n")
+	}
 	b.WriteString(lipgloss.NewStyle().Bold(true).Render("Branches & open PRs"))
 	b.WriteString("\n")
 	return b.String()
+}
+
+func (m *Model) worktreesForRepo(primary string) []string {
+	if m.worktreesByRepo == nil {
+		return nil
+	}
+	wts := m.worktreesByRepo[primary]
+	if len(wts) == 0 {
+		return nil
+	}
+	return wts
 }
 
 func firstLineIndexAfterHeader(header string) int {

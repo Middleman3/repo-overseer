@@ -6,11 +6,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+
+	"nested-git-tui/internal/gitx"
 )
 
-// GitRoots returns canonical absolute paths of every git work tree under root
-// (detects .git directories and .git submodule gitfiles).
-func GitRoots(root string) ([]string, error) {
+// findAllGitRoots walks root and returns every distinct git work tree path (including linked worktrees).
+func findAllGitRoots(root string) ([]string, error) {
 	root, err := filepath.Abs(root)
 	if err != nil {
 		return nil, err
@@ -61,4 +62,16 @@ func GitRoots(root string) ([]string, error) {
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// GitRoots returns one path per logical repository (the primary worktree when multiple linked
+// worktrees appear under root). worktreesByPrimary maps that primary path to every linked path
+// (including the primary), with the primary first.
+func GitRoots(root string) ([]string, map[string][]string, error) {
+	all, err := findAllGitRoots(root)
+	if err != nil {
+		return nil, nil, err
+	}
+	pri, m := gitx.DedupeWorktreeRoots(all)
+	return pri, m, nil
 }

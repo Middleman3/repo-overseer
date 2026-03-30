@@ -34,7 +34,7 @@ func main() {
 
 	warnIfGHUnauthenticated()
 
-	repos, err := scan.GitRoots(rootAbs)
+	repos, worktreesByPrimary, err := scan.GitRoots(rootAbs)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "scan: %v\n", err)
 		os.Exit(1)
@@ -44,7 +44,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	m := ui.New(rootAbs, repos, *prLimit)
+	m := ui.New(rootAbs, repos, worktreesByPrimary, *prLimit)
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
