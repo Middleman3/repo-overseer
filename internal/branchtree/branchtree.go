@@ -146,7 +146,11 @@ func (d *Dir) sortPRs() {
 }
 
 // Flatten walks folders then branches (depth-first); PRs are nested under their branch.
-func Flatten(d *Dir, depth int, out *[]Row) {
+// isExpanded(rel) returns whether folder rel should show its children; if nil, all folders are expanded.
+func Flatten(d *Dir, depth int, isExpanded func(string) bool, out *[]Row) {
+	if isExpanded == nil {
+		isExpanded = func(string) bool { return true }
+	}
 	for _, sub := range d.Subdirs {
 		*out = append(*out, Row{
 			Kind:  RowFolder,
@@ -154,7 +158,9 @@ func Flatten(d *Dir, depth int, out *[]Row) {
 			Rel:   sub.Rel,
 			Label: sub.Name,
 		})
-		Flatten(sub, depth+1, out)
+		if isExpanded(sub.Rel) {
+			Flatten(sub, depth+1, isExpanded, out)
+		}
 	}
 	for _, leaf := range d.Leaves {
 		*out = append(*out, Row{

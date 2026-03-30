@@ -14,6 +14,7 @@ import (
 	"nested-git-tui/internal/timefmt"
 	"nested-git-tui/internal/tree"
 
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -61,11 +62,14 @@ type Model struct {
 	treeInnerH int
 	leftInnerW int
 	leftColW   int
-	leftFrac   float64 // fraction of total width for the left sidebar (Shift+←/→ adjusts)
-	vp         viewport.Model
-	focus      focus
-	cache      map[string]snapshot
-	allRepos   []string // every scanned repo path (for fetch + eager load)
+	leftFrac          float64 // fraction of total width for the left sidebar (Shift+←/→ adjusts)
+	vp                viewport.Model
+	previewSelLine    int
+	lastPreviewRowKey string // tree.RowKind + Rel — reset line when selection changes
+	focus             focus
+	cache             map[string]snapshot
+	branchExpanded    map[string]bool // key: repoAbs + "\x00" + folder Rel — preview branch tree folders
+	allRepos          []string        // every scanned repo path (for fetch + eager load)
 	width      int
 	height     int
 }
@@ -88,7 +92,13 @@ func New(scanRoot string, absRepos []string, prLimit int) *Model {
 	m.rebuildRows()
 
 	m.vp = viewport.New(0, 0)
-	m.vp.SetContent("Use ↑/↓ or j/k to move. Space expands/collapses folders. Tab switches panes.")
+	km := m.vp.KeyMap
+	km.PageDown = key.NewBinding(
+		key.WithKeys("pgdown", "f"),
+		key.WithHelp("f/pgdn", "page down"),
+	)
+	m.vp.KeyMap = km
+	m.lastPreviewRowKey = m.currentRowKey()
 
 	return m
 }
@@ -156,14 +166,16 @@ func (m *Model) handleTreeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cursor--
 			m.ensureScroll()
 		}
-		m.vp.SetContent(m.previewForSelection())
+		m.resetPreviewLineForNewTreeRow()
+		m.applyPreviewContent()
 		return m, m.loadSelectedCmd()
 	case "down", "j":
 		if m.cursor < len(m.rows)-1 {
 			m.cursor++
 			m.ensureScroll()
 		}
-		m.vp.SetContent(m.previewForSelection())
+		m.resetPreviewLineForNewTreeRow()
+		m.applyPreviewContent()
 		return m, m.loadSelectedCmd()
 	case "pgup":
 		m.cursor -= m.treeInnerH
@@ -171,7 +183,8 @@ func (m *Model) handleTreeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cursor = 0
 		}
 		m.ensureScroll()
-		m.vp.SetContent(m.previewForSelection())
+		m.resetPreviewLineForNewTreeRow()
+		m.applyPreviewContent()
 		return m, m.loadSelectedCmd()
 	case "pgdown":
 		m.cursor += m.treeInnerH
@@ -179,32 +192,216 @@ func (m *Model) handleTreeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cursor = len(m.rows) - 1
 		}
 		m.ensureScroll()
-		m.vp.SetContent(m.previewForSelection())
+		m.resetPreviewLineForNewTreeRow()
+		m.applyPreviewContent()
 		return m, m.loadSelectedCmd()
 	case "home", "g":
 		m.cursor = 0
 		m.scroll = 0
-		m.vp.SetContent(m.previewForSelection())
+		m.resetPreviewLineForNewTreeRow()
+		m.applyPreviewContent()
 		return m, m.loadSelectedCmd()
 	case "end", "G":
 		if len(m.rows) > 0 {
 			m.cursor = len(m.rows) - 1
 			m.ensureScroll()
 		}
-		m.vp.SetContent(m.previewForSelection())
+		m.resetPreviewLineForNewTreeRow()
+		m.applyPreviewContent()
 		return m, m.loadSelectedCmd()
 	case " ":
 		if m.cursor >= 0 && m.cursor < len(m.rows) {
 			r := m.rows[m.cursor]
 			if r.Kind == tree.RowFolder {
 				m.toggleFolder(r.Rel)
-				m.vp.SetContent(m.previewForSelection())
+				m.resetPreviewLineForNewTreeRow()
+				m.applyPreviewContent()
 				return m, m.loadSelectedCmd()
 			}
 		}
 		return m, nil
 	}
 	return m, nil
+}
+
+func (m *Model) handlePreviewKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "up", "k":
+		if m.previewSelLine > 0 {
+			m.previewSelLine--
+		}
+		m.applyPreviewContent()
+		return m, nil
+	case "down", "j":
+		n := m.previewPlainLineCount()
+		if n > 0 && m.previewSelLine < n-1 {
+			m.previewSelLine++
+		}
+		m.applyPreviewContent()
+		return m, nil
+	case "pgup":
+		m.previewSelLine -= m.vp.Height
+		if m.previewSelLine < 0 {
+			m.previewSelLine = 0
+		}
+		m.applyPreviewContent()
+		return m, nil
+	case "pgdown":
+		n := m.previewPlainLineCount()
+		if n == 0 {
+			return m, nil
+		}
+		m.previewSelLine += m.vp.Height
+		if m.previewSelLine >= n {
+			m.previewSelLine = n - 1
+		}
+		m.applyPreviewContent()
+		return m, nil
+	case "home", "g":
+		m.previewSelLine = 0
+		m.applyPreviewContent()
+		return m, nil
+	case "end", "G":
+		n := m.previewPlainLineCount()
+		if n > 0 {
+			m.previewSelLine = n - 1
+		}
+		m.applyPreviewContent()
+		return m, nil
+	case "enter":
+		u := m.previewURLAtSelLine()
+		if u == "" {
+			return m, nil
+		}
+		return m, openURLCmd(u)
+	case " ":
+		repo, rel, ok := m.branchFolderAtPreviewLine()
+		if !ok {
+			return m, nil
+		}
+		m.toggleBranchFolder(repo, rel)
+		m.applyPreviewContent()
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.vp, cmd = m.vp.Update(msg)
+	return m, cmd
+}
+
+func (m *Model) previewPlainLineCount() int {
+	plain := strings.ReplaceAll(m.previewForSelection(), "\r\n", "\n")
+	if plain == "" {
+		return 0
+	}
+	return len(strings.Split(plain, "\n"))
+}
+
+func (m *Model) previewURLAtSelLine() string {
+	plain := strings.ReplaceAll(m.previewForSelection(), "\r\n", "\n")
+	lines := strings.Split(plain, "\n")
+	if m.previewSelLine < 0 || m.previewSelLine >= len(lines) {
+		return ""
+	}
+	return FirstOSC8URL(lines[m.previewSelLine])
+}
+
+func branchFolderKey(repoAbs, folderRel string) string {
+	return repoAbs + "\x00" + folderRel
+}
+
+func (m *Model) isBranchFolderExpanded(repoAbs, folderRel string) bool {
+	if m.branchExpanded == nil {
+		return true
+	}
+	v, ok := m.branchExpanded[branchFolderKey(repoAbs, folderRel)]
+	if !ok {
+		return true
+	}
+	return v
+}
+
+func (m *Model) toggleBranchFolder(repoAbs, folderRel string) {
+	if m.branchExpanded == nil {
+		m.branchExpanded = map[string]bool{}
+	}
+	k := branchFolderKey(repoAbs, folderRel)
+	m.branchExpanded[k] = !m.isBranchFolderExpanded(repoAbs, folderRel)
+}
+
+func (m *Model) snapshotHeaderBeforeTree(path string, s snapshot) string {
+	var b strings.Builder
+	b.WriteString(lipgloss.NewStyle().Bold(true).Render(m.relDisplay(path)))
+	b.WriteString("\n\n")
+	if s.current != "" {
+		fmt.Fprintf(&b, "Checked out: %s\n\n", s.current)
+	} else {
+		b.WriteString("Checked out: (detached or empty)\n\n")
+	}
+	b.WriteString(lipgloss.NewStyle().Bold(true).Render("Branches & open PRs"))
+	b.WriteString("\n")
+	return b.String()
+}
+
+func firstLineIndexAfterHeader(header string) int {
+	h := strings.TrimSuffix(header, "\n")
+	if h == "" {
+		return 0
+	}
+	return len(strings.Split(h, "\n"))
+}
+
+func (m *Model) branchTreeContentStartLine(path string, s snapshot) int {
+	return firstLineIndexAfterHeader(m.snapshotHeaderBeforeTree(path, s))
+}
+
+func (m *Model) branchRowsAndUnmatched(repoPath string, s snapshot) (rows []branchtree.Row, unmatched []ghpr.PR) {
+	if s.gitErr != "" {
+		return nil, nil
+	}
+	if !gitx.IsWorkTree(repoPath) {
+		return nil, nil
+	}
+	if len(s.unified) == 0 && len(s.prs) == 0 {
+		return nil, nil
+	}
+	root := branchtree.Build(s.unified)
+	var prs []ghpr.PR
+	if s.ghErr == "" {
+		prs = s.prs
+	}
+	unmatched = branchtree.AssignPRs(root, prs)
+	branchtree.Flatten(root, 0, func(rel string) bool {
+		return m.isBranchFolderExpanded(repoPath, rel)
+	}, &rows)
+	return rows, unmatched
+}
+
+func (m *Model) branchFolderAtPreviewLine() (repoAbs, folderRel string, ok bool) {
+	p := m.selectedAbs()
+	if p == "" {
+		return "", "", false
+	}
+	snap, ok := m.cache[p]
+	if !ok {
+		return "", "", false
+	}
+	start := m.branchTreeContentStartLine(p, snap)
+	if m.previewSelLine < start {
+		return "", "", false
+	}
+	rows, _ := m.branchRowsAndUnmatched(p, snap)
+	if len(rows) == 0 {
+		return "", "", false
+	}
+	idx := m.previewSelLine - start
+	if idx < 0 || idx >= len(rows) {
+		return "", "", false
+	}
+	r := rows[idx]
+	if r.Kind != branchtree.RowFolder {
+		return "", "", false
+	}
+	return p, r.Rel, true
 }
 
 // Update implements tea.Model.
@@ -219,8 +416,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case snapshotMsg:
 		m.cache[msg.path] = msg.snap
 		if m.selectedAbs() == msg.path {
-			m.vp.SetContent(m.renderPreview(msg.path))
-			m.vp.GotoTop()
+			m.previewSelLine = 0
+			m.applyPreviewContent()
 		}
 		return m, nil
 
@@ -231,8 +428,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for p, snap := range msg.snaps {
 			m.cache[p] = snap
 		}
-		m.vp.SetContent(m.previewForSelection())
-		m.vp.GotoTop()
+		m.previewSelLine = 0
+		m.applyPreviewContent()
 		return m, nil
 
 	case tea.KeyMsg:
@@ -271,9 +468,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if m.focus == focusPreview {
-			var cmd tea.Cmd
-			m.vp, cmd = m.vp.Update(msg)
-			return m, cmd
+			return m.handlePreviewKey(msg)
 		}
 		return m.handleTreeKey(msg)
 	}
@@ -319,7 +514,7 @@ func (m *Model) layout() {
 	m.leftColW = leftW
 	m.vp.Width = rightW
 	m.vp.Height = contentH
-	m.vp.SetContent(m.previewForSelection())
+	m.applyPreviewContent()
 	m.ensureScroll()
 }
 
@@ -332,6 +527,65 @@ func (m *Model) selectedAbs() string {
 		return ""
 	}
 	return r.Abs
+}
+
+func (m *Model) currentRowKey() string {
+	if m.cursor < 0 || m.cursor >= len(m.rows) {
+		return ""
+	}
+	r := m.rows[m.cursor]
+	return fmt.Sprintf("%d:%s", r.Kind, r.Rel)
+}
+
+func (m *Model) resetPreviewLineForNewTreeRow() {
+	k := m.currentRowKey()
+	if k != m.lastPreviewRowKey {
+		m.lastPreviewRowKey = k
+		m.previewSelLine = 0
+	}
+}
+
+func (m *Model) applyPreviewContent() {
+	plain := m.previewForSelection()
+	plain = strings.ReplaceAll(plain, "\r\n", "\n")
+	lines := strings.Split(plain, "\n")
+	n := len(lines)
+	if n == 0 {
+		m.vp.SetContent(plain)
+		return
+	}
+	if m.previewSelLine < 0 {
+		m.previewSelLine = 0
+	}
+	if m.previewSelLine >= n {
+		m.previewSelLine = n - 1
+	}
+	selStyle := lipgloss.NewStyle().Background(lipgloss.Color("237")).Foreground(lipgloss.Color("252"))
+	for i := range lines {
+		if i == m.previewSelLine {
+			lines[i] = selStyle.Render(lines[i])
+		}
+	}
+	m.vp.SetContent(strings.Join(lines, "\n"))
+	m.ensurePreviewScrollVisible()
+}
+
+func (m *Model) ensurePreviewScrollVisible() {
+	n := m.vp.TotalLineCount()
+	if n == 0 {
+		return
+	}
+	h := m.vp.Height
+	if h <= 0 {
+		return
+	}
+	y := m.previewSelLine
+	if y < m.vp.YOffset {
+		m.vp.SetYOffset(y)
+	}
+	if y >= m.vp.YOffset+h {
+		m.vp.SetYOffset(y - h + 1)
+	}
 }
 
 func (m *Model) previewForSelection() string {
@@ -349,14 +603,6 @@ func (m *Model) previewForSelection() string {
 	return "Loading…"
 }
 
-func (m *Model) renderPreview(path string) string {
-	snap, ok := m.cache[path]
-	if !ok {
-		return "Loading…"
-	}
-	return m.renderSnapshot(path, snap)
-}
-
 func (m *Model) relDisplay(abs string) string {
 	rel, err := filepath.Rel(m.scanRoot, abs)
 	if err != nil {
@@ -372,18 +618,9 @@ func (m *Model) relDisplay(abs string) string {
 func (m *Model) renderSnapshot(path string, s snapshot) string {
 	now := time.Now()
 	var b strings.Builder
-	b.WriteString(lipgloss.NewStyle().Bold(true).Render(m.relDisplay(path)))
-	b.WriteString("\n\n")
-	if s.current != "" {
-		fmt.Fprintf(&b, "Checked out: %s\n\n", s.current)
-	} else {
-		b.WriteString("Checked out: (detached or empty)\n\n")
-	}
-
-	b.WriteString(lipgloss.NewStyle().Bold(true).Render("Branches & open PRs"))
-	b.WriteString("\n")
+	b.WriteString(m.snapshotHeaderBeforeTree(path, s))
 	webBase, _ := gitx.GitHubWebBase(path)
-	b.WriteString(renderBranchTree(path, s, now, webBase))
+	b.WriteString(m.renderBranchTree(path, s, now, webBase))
 	if s.ghErr != "" {
 		fmt.Fprintf(&b, "\n  %s\n", s.ghErr)
 		if hint := ghpr.AuthHint(); hint != "" {
@@ -393,7 +630,7 @@ func (m *Model) renderSnapshot(path string, s snapshot) string {
 	return b.String()
 }
 
-func renderBranchTree(repoPath string, s snapshot, now time.Time, webBase string) string {
+func (m *Model) renderBranchTree(repoPath string, s snapshot, now time.Time, webBase string) string {
 	if s.gitErr != "" {
 		return fmt.Sprintf("  error: %s\n", s.gitErr)
 	}
@@ -403,20 +640,17 @@ func renderBranchTree(repoPath string, s snapshot, now time.Time, webBase string
 	if len(s.unified) == 0 && len(s.prs) == 0 {
 		return "  (no branches)\n"
 	}
-	root := branchtree.Build(s.unified)
-	var prs []ghpr.PR
-	if s.ghErr == "" {
-		prs = s.prs
-	}
-	unmatched := branchtree.AssignPRs(root, prs)
-	var rows []branchtree.Row
-	branchtree.Flatten(root, 0, &rows)
+	rows, unmatched := m.branchRowsAndUnmatched(repoPath, s)
 	var out strings.Builder
 	for _, r := range rows {
 		ind := strings.Repeat("  ", r.Depth)
 		switch r.Kind {
 		case branchtree.RowFolder:
-			fmt.Fprintf(&out, "%s▾ %s\n", ind, r.Label)
+			sym := "▾"
+			if !m.isBranchFolderExpanded(repoPath, r.Rel) {
+				sym = "▸"
+			}
+			fmt.Fprintf(&out, "%s%s %s\n", ind, sym, r.Label)
 		case branchtree.RowBranch:
 			if r.U == nil {
 				continue
@@ -710,7 +944,7 @@ func (m *Model) View() string {
 
 	help := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("241")).
-		Render("tab · shift+←/→ · space · g/G · r: fetch+reload repo · q · (startup: fetch --prune + preload all)")
+		Render("tab: tree ↔ preview (↑/↓ · enter link · space: branch folder · f/pgdn scroll) · shift+←/→ · space (tree: repo folder) · g/G · r · q · startup: fetch --prune + preload")
 
 	// Leading newline avoids the first row sitting under the terminal/IDE chrome in some hosts.
 	return "\n" + lipgloss.JoinVertical(lipgloss.Left, row, "", help)
