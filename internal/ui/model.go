@@ -93,6 +93,13 @@ type pushPRDoneMsg struct {
 	err         error
 }
 
+type mergePRDoneMsg struct {
+	repo     string
+	number   int
+	snapshot string
+	err      error
+}
+
 type worktreeRemoveDoneMsg struct {
 	snapshotKey string
 	err         error
@@ -382,6 +389,8 @@ func (m *Model) handlePreviewKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleDeleteBranchRequest()
 	case "p", "P":
 		return m.handlePushPRRequest()
+	case "m", "M":
+		return m.handleMergePRRequest()
 	}
 	var cmd tea.Cmd
 	m.vp, cmd = m.vp.Update(msg)
@@ -842,6 +851,22 @@ func (m *Model) selectedPreviewBranchName() (repoAbs, branch string, ok bool) {
 	}
 }
 
+// isArchiveHotkey is true for the archive shortcut (a / A).
+// Prefer matching on runes (robust across layouts) and ignore paste events.
+func isArchiveHotkey(msg tea.KeyMsg) bool {
+	if msg.Paste {
+		return false
+	}
+	if msg.Type == tea.KeyRunes && len(msg.Runes) == 1 {
+		switch msg.Runes[0] {
+		case 'a', 'A':
+			return true
+		}
+	}
+	s := msg.String()
+	return s == "a" || s == "A"
+}
+
 func (m *Model) handleArchiveBranchRequest() (tea.Model, tea.Cmd) {
 	repo, branch, ok := m.selectedPreviewBranchName()
 	if !ok {
@@ -1103,6 +1128,48 @@ func (m *Model) runPushPRCmd(wtDir, branch string) tea.Cmd {
 	}
 }
 
+func (m *Model) selectedPreviewPR() (repoAbs string, pr ghpr.PR, ok bool) {
+	p := m.selectedAbs()
+	if p == "" {
+		return "", ghpr.PR{}, false
+	}
+	snap, have := m.cache[p]
+	if !have {
+		return "", ghpr.PR{}, false
+	}
+	start := m.branchTreeContentStartLine(p, snap)
+	rows, _ := m.branchRowsAndUnmatched(p, snap)
+	if len(rows) == 0 {
+		return "", ghpr.PR{}, false
+	}
+	idx := m.previewSelLine - start
+	if idx < 0 || idx >= len(rows) {
+		return "", ghpr.PR{}, false
+	}
+	r := rows[idx]
+	if r.Kind != branchtree.RowPR || r.PR == nil {
+		return "", ghpr.PR{}, false
+	}
+	return p, *r.PR, true
+}
+
+func (m *Model) handleMergePRRequest() (tea.Model, tea.Cmd) {
+	repo, pr, ok := m.selectedPreviewPR()
+	if !ok {
+		return m, nil
+	}
+	m.statusMsg = fmt.Sprintf("Merging PR #%d…", pr.Number)
+	return m, m.runMergePRCmd(repo, pr.Number)
+}
+
+func (m *Model) runMergePRCmd(repo string, number int) tea.Cmd {
+	snapshotKey := m.selectedAbs()
+	return func() tea.Msg {
+		err := ghpr.Merge(repo, number)
+		return mergePRDoneMsg{repo: repo, number: number, snapshot: snapshotKey, err: err}
+	}
+}
+
 func (m *Model) linkText(url, plain string) string {
 	if m.prefs.ShowPreviewLinks && url != "" {
 		return OSC8(url, plain)
@@ -1192,6 +1259,19 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		delete(m.cache, msg.snapshotKey)
 		return m, loadSnapshot(msg.snapshotKey, m.prLimit)
 
+	case mergePRDoneMsg:
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("Merge failed: %v", msg.err)
+		} else {
+			m.statusMsg = fmt.Sprintf("Merged PR #%d", msg.number)
+		}
+		delete(m.cache, msg.repo)
+		if msg.snapshot != "" {
+			delete(m.cache, msg.snapshot)
+			return m, loadSnapshot(msg.snapshot, m.prLimit)
+		}
+		return m, loadSnapshot(msg.repo, m.prLimit)
+
 	case worktreeRemoveDoneMsg:
 		m.worktreeRemove = nil
 		if msg.err != nil {
@@ -1213,9 +1293,36 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.archiveConfirm != nil {
 			return m.handleArchiveDialogKey(msg)
 		}
-		switch msg.String() {
-		case "a", "A":
+		if isArchiveHotkey(msg) {
 			return m.handleArchiveBranchRequest()
+		}
+		switch msg.String() {
+		case "shift+up":
+			// Scroll the focused pane without moving the selection.
+			if m.focus == focusPreview {
+				m.vp.LineUp(1)
+				return m, nil
+			}
+			if m.treeInnerH > 0 && len(m.rows) > 0 && m.scroll > 0 {
+				m.scroll--
+			}
+			return m, nil
+		case "shift+down":
+			// Scroll the focused pane without moving the selection.
+			if m.focus == focusPreview {
+				m.vp.LineDown(1)
+				return m, nil
+			}
+			if m.treeInnerH > 0 && len(m.rows) > 0 {
+				maxScroll := len(m.rows) - m.treeInnerH
+				if maxScroll < 0 {
+					maxScroll = 0
+				}
+				if m.scroll < maxScroll {
+					m.scroll++
+				}
+			}
+			return m, nil
 		case "shift+left":
 			m.leftFrac -= 0.02
 			if m.leftFrac < 0.12 {
@@ -1245,13 +1352,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.applyPreviewContent()
 			return m, nil
 		case "r":
-			p := m.selectedAbs()
-			if p == "" {
-				return m, nil
-			}
-			delete(m.cache, p)
-			m.vp.SetContent("Refreshing…")
-			return m, refreshRepoSnapshot(p, m.prLimit)
+			m.statusMsg = "Refreshing all repositories…"
+			m.vp.SetContent("Refreshing all repositories…")
+			return m, fetchAllRepos(m.allRepos)
 		}
 
 		if m.focus == focusPreview {
@@ -1400,6 +1503,10 @@ func (m *Model) applyPreviewContent() {
 
 func (m *Model) stylePreviewLinesAtGlobal(plain string, lineOffset int) string {
 	plain = strings.ReplaceAll(plain, "\r\n", "\n")
+	// Avoid creating a phantom extra line when the source ends with "\n".
+	// This is important in split-header mode where headerLines is used to size
+	// the viewport: an extra empty line would push content off-screen.
+	plain = strings.TrimSuffix(plain, "\n")
 	lines := strings.Split(plain, "\n")
 	selStyle := lipgloss.NewStyle().Background(lipgloss.Color("237")).Foreground(lipgloss.Color("252"))
 	for i := range lines {
@@ -1955,6 +2062,8 @@ func (m *Model) View() string {
 		stack = append(stack, "", dlg)
 	} else if dlg := m.renderDeleteDialog(); dlg != "" {
 		stack = append(stack, "", dlg)
+	} else if dlg := m.renderArchiveDialog(); dlg != "" {
+		stack = append(stack, "", dlg)
 	}
 	if m.statusMsg != "" {
 		statusW := m.width - 4
@@ -1968,9 +2077,14 @@ func (m *Model) View() string {
 				Render(m.statusMsg))
 	}
 
+	helpW := m.width - 4
+	if helpW < 24 {
+		helpW = 24
+	}
 	help := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("241")).
-		Render("tab/shift+tab/←/→: panes · L: preview links · preview: ↑/↓ · enter URL · c checkout · d delete branch / worktree path · a archive · p push/PR · space folder · f/pgdn · shift+←/→ width · tree enter: branches on GitHub · g/G · r · q")
+		Width(helpW).
+		Render("tab/shift+tab/←/→: panes · L: preview links · preview: ↑/↓ · enter URL · c checkout · d delete branch / worktree path · A archive · p push/PR · m merge PR · space folder · f/pgdn · shift+↑/↓ scroll pane · shift+←/→ width · tree enter: branches on GitHub · g/G · r refresh all · q")
 
 	stack = append(stack, "", help)
 
