@@ -8,17 +8,20 @@ import (
 	"strings"
 )
 
-// PushCreatePR pushes branch to origin when no remote tracking branch exists yet,
-// then runs gh pr create with an empty body and the branch name as title.
+// PushCreatePR opens a PR for branch with an empty body and branch name as title.
+// If a local branch exists and origin/<branch> does not, it pushes first.
+// If only origin/<branch> exists, it creates the PR directly from that remote head.
 // It does not switch branches, which avoids linked-worktree checkout conflicts.
 func PushCreatePR(repo, branch string) error {
 	if strings.TrimSpace(branch) == "" {
 		return fmt.Errorf("empty branch name")
 	}
-	if !localBranchExists(repo, branch) {
-		return fmt.Errorf("no local branch %q", branch)
+	hasLocal := localBranchExists(repo, branch)
+	hasRemote := remoteBranchExists(repo, branch)
+	if !hasLocal && !hasRemote {
+		return fmt.Errorf("branch %q not found locally or on origin", branch)
 	}
-	if !remoteBranchExists(repo, branch) {
+	if hasLocal && !hasRemote {
 		cmd := gitCmd(repo, "push", "-u", "origin", branch)
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr

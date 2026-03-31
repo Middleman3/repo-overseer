@@ -16,6 +16,7 @@ import (
 func main() {
 	root := flag.String("root", ".", "directory to scan for nested git repositories")
 	prLimit := flag.Int("pr-limit", 200, "max open PRs to fetch per repository (gh)")
+	fullscreen := flag.Bool("fullscreen", false, "run in full-screen alt-screen mode")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Interactive TUI for nested git repos (branches, origin/*, open PRs).\n")
@@ -45,7 +46,11 @@ func main() {
 	}
 
 	m := ui.New(rootAbs, repos, worktreesByPrimary, *prLimit)
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	opts := []tea.ProgramOption{tea.WithMouseCellMotion()}
+	if *fullscreen {
+		opts = append(opts, tea.WithAltScreen())
+	}
+	p := tea.NewProgram(m, opts...)
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
