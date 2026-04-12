@@ -156,6 +156,7 @@ type Model struct {
 	pendingPreviewLine int    // absolute preview line; -1 means none
 	previewPaneH       int    // last laid-out inner height for the right column (header + viewport)
 	previewHeader      string // fixed region above the scrollable branch list (styled); empty if not split
+	showInlineHelp     bool   // toggled with i; default off to avoid consuming terminal height
 }
 
 // New builds the TUI model. absRepos must be non-empty absolute paths under scanRoot (one per logical repo).
@@ -173,8 +174,9 @@ func New(scanRoot string, absRepos []string, worktreesByPrimary map[string][]str
 		allRepos:        append([]string(nil), absRepos...),
 		worktreesByRepo: worktreesByPrimary,
 		// ~60% of the previous default (2/5): 0.4 * 0.6 = 0.24
-		leftFrac: 0.24,
-		prefs:    loadPrefs(),
+		leftFrac:       0.24,
+		prefs:          loadPrefs(),
+		showInlineHelp: false,
 	}
 	m.rebuildRows()
 
@@ -1351,6 +1353,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			_ = savePrefs(m.prefs)
 			m.applyPreviewContent()
 			return m, nil
+		case "c", "C":
+			// If a transient status line is visible, treat c as "clear status" first.
+			// When no status is visible, c keeps its existing meaning in preview mode (checkout).
+			if m.statusMsg != "" {
+				m.statusMsg = ""
+				m.layout()
+				return m, nil
+			}
+		case "i", "I":
+			m.showInlineHelp = !m.showInlineHelp
+			m.layout()
+			return m, nil
 		case "r":
 			m.statusMsg = "Refreshing all repositories…"
 			m.vp.SetContent("Refreshing all repositories…")
@@ -1376,8 +1390,8 @@ func (m *Model) layout() {
 	if m.width <= 0 || m.height <= 0 {
 		return
 	}
-	// Reserve an extra line so the leading newline in View() does not push the bottom off-screen.
-	contentH := m.height - 3
+	// Reserve space for bottom blocks (dialogs/status/help) so panes never exceed terminal height.
+	contentH := m.height - 3 - m.bottomContentHeight()
 	if contentH < 6 {
 		contentH = 6
 	}
@@ -1439,7 +1453,7 @@ func (m *Model) applyPreviewContent() {
 	p := m.selectedAbs()
 	contentH := m.previewPaneH
 	if contentH <= 0 && m.height > 0 {
-		contentH = m.height - 3
+		contentH = m.height - 3 - m.bottomContentHeight()
 		if contentH < 6 {
 			contentH = 6
 		}
@@ -1499,6 +1513,55 @@ func (m *Model) applyPreviewContent() {
 	}
 	m.vp.SetContent(strings.Join(lines, "\n"))
 	m.ensurePreviewScrollVisibleFull()
+}
+
+func (m *Model) renderInlineHelp() string {
+	helpW := m.width - 4
+	if helpW < 24 {
+		helpW = 24
+	}
+	return lipgloss.NewStyle().
+		Foreground(lipgloss.Color("241")).
+		Width(helpW).
+		Render("i: hide controls · tab/shift+tab/←/→: panes · L: preview links · preview: ↑/↓ · enter URL · c checkout · d delete branch / worktree path · A archive · p push/PR · m merge PR · space folder · f/pgdn · shift+↑/↓ scroll pane · shift+←/→ width · tree enter: branches on GitHub · g/G · r refresh all · q")
+}
+
+func (m *Model) bottomContentHeight() int {
+	if m.width <= 0 {
+		return 0
+	}
+	total := 0
+	addBlock := func(block string) {
+		if block == "" {
+			return
+		}
+		// View inserts a blank separator before every bottom block.
+		total++
+		total += lipgloss.Height(block)
+	}
+
+	if dlg := m.renderWorktreeRemoveDialog(); dlg != "" {
+		addBlock(dlg)
+	} else if dlg := m.renderDeleteDialog(); dlg != "" {
+		addBlock(dlg)
+	} else if dlg := m.renderArchiveDialog(); dlg != "" {
+		addBlock(dlg)
+	}
+	if m.statusMsg != "" {
+		statusW := m.width - 4
+		if statusW < 24 {
+			statusW = 24
+		}
+		status := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("214")).
+			Width(statusW).
+			Render(m.statusMsg)
+		addBlock(status)
+	}
+	if m.showInlineHelp {
+		addBlock(m.renderInlineHelp())
+	}
+	return total
 }
 
 func (m *Model) stylePreviewLinesAtGlobal(plain string, lineOffset int) string {
@@ -2077,18 +2140,26 @@ func (m *Model) View() string {
 				Render(m.statusMsg))
 	}
 
-	helpW := m.width - 4
-	if helpW < 24 {
-		helpW = 24
+	if m.showInlineHelp {
+		stack = append(stack, "", m.renderInlineHelp())
 	}
-	help := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("241")).
-		Width(helpW).
-		Render("tab/shift+tab/←/→: panes · L: preview links · preview: ↑/↓ · enter URL · c checkout · d delete branch / worktree path · A archive · p push/PR · m merge PR · space folder · f/pgdn · shift+↑/↓ scroll pane · shift+←/→ width · tree enter: branches on GitHub · g/G · r refresh all · q")
 
-	stack = append(stack, "", help)
+	frame := lipgloss.JoinVertical(lipgloss.Left, stack...)
+	return m.fitFrameToTerminal(frame)
+}
 
-	return lipgloss.JoinVertical(lipgloss.Left, stack...)
+func (m *Model) fitFrameToTerminal(frame string) string {
+	if m.height <= 0 {
+		return frame
+	}
+	lines := strings.Split(frame, "\n")
+	if len(lines) > m.height {
+		lines = lines[:m.height]
+	}
+	for len(lines) < m.height {
+		lines = append(lines, "")
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m *Model) rightPreviewBody() string {

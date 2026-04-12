@@ -123,17 +123,48 @@ func RemoveWorktree(primaryRepo, worktreePath string, force bool) error {
 	if worktreePath == "" {
 		return fmt.Errorf("empty worktree path")
 	}
+	primaryRepo = filepath.Clean(primaryRepo)
 	args := []string{"worktree", "remove", worktreePath}
 	if force {
 		args = []string{"worktree", "remove", "--force", worktreePath}
 	}
-	cmd := gitCmd(primaryRepo, args...)
+
+	// Fast path: use the selected repository context.
+	if err := runWorktreeRemove(primaryRepo, args); err == nil {
+		return nil
+	} else {
+		// Fallback: some external tools (including Cursor) can create worktrees under a
+		// different primary repo than the one selected in the UI. Retry from the target
+		// worktree's own git-common-dir root when it differs.
+		if fallbackRepo := inferRepoRootFromWorktree(worktreePath); fallbackRepo != "" && fallbackRepo != primaryRepo {
+			if fallbackErr := runWorktreeRemove(fallbackRepo, args); fallbackErr == nil {
+				return nil
+			}
+		}
+		return err
+	}
+}
+
+func runWorktreeRemove(repo string, args []string) error {
+	cmd := gitCmd(repo, args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("git worktree remove %q: %w: %s", worktreePath, err, strings.TrimSpace(stderr.String()))
+		return fmt.Errorf("git worktree remove %q: %w: %s", args[len(args)-1], err, strings.TrimSpace(stderr.String()))
 	}
 	return nil
+}
+
+func inferRepoRootFromWorktree(worktreePath string) string {
+	commonDir, err := GitCommonDirAbs(worktreePath)
+	if err != nil {
+		return ""
+	}
+	// Typical value is "<repo>/.git". Use parent as the repository root.
+	if filepath.Base(commonDir) == ".git" {
+		return filepath.Clean(filepath.Dir(commonDir))
+	}
+	return ""
 }
 
 // ListWorktreePaths returns linked worktree paths in git's order (main worktree first).
